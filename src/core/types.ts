@@ -87,4 +87,31 @@ export type AgentEvent =
   | { type: 'tool_end'; toolName: string; result: ToolResult; durationMs: number }
   | { type: 'response'; content: string }
   | { type: 'error'; error: string }
+  /** 被中间件拦截（注入检测 / 预算熔断 / 后续版本的合规与配额）；by 为中间件名 */
+  | { type: 'blocked'; by: string; reason: string }
   | { type: 'done'; totalTokens: TokenUsage; totalCost: number };
+
+// ============ 模型调用抽象 ============
+
+/** 一次模型调用的归一化结果，屏蔽具体 SDK 的响应形态 */
+export interface ChatResponse {
+  content: string;
+  toolUse?: ToolUse;
+  usage: TokenUsage;
+  stopReason: string;
+}
+
+/**
+ * 模型提供方接口。
+ *
+ * AgentLoop 依赖此接口而非 ModelProvider 具体类 —— 这样测试可以注入脚本化的假实现，
+ * 从而覆盖「循环终止 / 预算熔断 / 确认拒绝 / 工具报错回喂」这些不发真实请求就测不到的路径。
+ */
+export interface ChatProvider {
+  chat(
+    systemPrompt: string,
+    messages: Message[],
+    tools: AgentTool[]
+  ): Promise<ChatResponse>;
+  getModel(): string;
+}

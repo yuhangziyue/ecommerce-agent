@@ -1,15 +1,19 @@
 import Anthropic from '@anthropic-ai/sdk';
-import type { AgentTool, Message, TokenUsage, ToolUse } from './types.js';
+import type {
+  AgentTool,
+  ChatProvider,
+  ChatResponse,
+  Message,
+  TokenUsage,
+  ToolUse,
+} from './types.js';
 import type { TSchema } from '@sinclair/typebox';
 
-interface ChatResponse {
-  content: string;
-  toolUse?: ToolUse;
-  usage: TokenUsage;
-  stopReason: string;
-}
-
-function toolToAnthropicSchema(tool: AgentTool<TSchema>): Anthropic.Tool {
+/**
+ * 工具定义 → Anthropic tool schema。
+ * 导出以便单测直接断言转换结果，不必发真实请求。
+ */
+export function toolToAnthropicSchema(tool: AgentTool<TSchema>): Anthropic.Tool {
   const { type: _type, ...properties } = tool.parameters as any;
   return {
     name: tool.name,
@@ -21,7 +25,14 @@ function toolToAnthropicSchema(tool: AgentTool<TSchema>): Anthropic.Tool {
   };
 }
 
-function messagesToAnthropicFormat(
+/**
+ * 内部 Message[] → Anthropic MessageParam[]。
+ *
+ * 关键约束：`tool` 角色消息必须转成携带 `tool_result` 块的 **user** 消息，
+ * 且缺少 `toolResult` 的 tool 消息会被丢弃 —— 发出没有配对的 tool_result 会被 API 拒绝。
+ * 导出以便单测直接断言配对形态。
+ */
+export function messagesToAnthropicFormat(
   messages: Message[]
 ): Anthropic.MessageParam[] {
   const result: Anthropic.MessageParam[] = [];
@@ -66,7 +77,7 @@ function messagesToAnthropicFormat(
   return result;
 }
 
-export class ModelProvider {
+export class ModelProvider implements ChatProvider {
   private client: Anthropic;
   private model: string;
 
