@@ -23,8 +23,7 @@ import type { AgentConfig } from './core/types.js';
  */
 async function main() {
   const config: AgentConfig = {
-    // ⚠️ 该型号已 deprecated（2026-06-15 退役）；升级与价格表同步是 v0.3 的范围
-    model: process.env.AGENT_MODEL || 'claude-sonnet-4-20250514',
+    model: process.env.AGENT_MODEL || 'claude-opus-5',
     apiKey: process.env.ANTHROPIC_API_KEY,
     maxTurns: 10,
     maxTokensPerSession: 100_000,

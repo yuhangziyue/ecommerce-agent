@@ -1,0 +1,22 @@
+{
+  // 测试代码的类型检查配置。
+  //
+  // 为什么需要单独一份：根 tsconfig 的 include 只有 `src/**/*`，测试代码完全不过类型检查。
+  // v0.3 把 Message.toolUse 改成复数 toolUses 时，tests/context-manager.test.ts 里
+  // 有一处 `m.toolUse` 没跟着改 —— tsc 一声不响，只有运行测试才炸。
+  // 后面还有十几个版本的重构，这个洞每次都会咬一口。
+  //
+  // 不合并进根 tsconfig 的原因：根配置带 outDir/declaration，是**构建**配置；
+  // 这份只做检查（noEmit），职责不同。
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    // 只检查不产出，因此 rootDir/outDir/declaration 这些构建相关项要放开，
+    // 否则 tests/ 会因「不在 rootDir(src) 下」被拒
+    "rootDir": ".",
+    "declaration": false,
+    "declarationMap": false,
+    "types": ["node", "vitest/globals"]
+  },
+  "include": ["src/**/*", "tests/**/*"]
+}

@@ -1,6 +1,7 @@
 import { Type, type Static } from '@sinclair/typebox';
 import type { AgentTool, ToolResult } from '../core/types.js';
 import { loadOrders } from '../data/loader.js';
+import { getDefaultRefundStore } from './refund-store.js';
 
 const RefundApplyParams = Type.Object({
   orderId: Type.String({ description: '要退款的订单号，如 ORD-20260801-001' }),
@@ -44,24 +45,32 @@ export const refundApplyTool: AgentTool<typeof RefundApplyParams> = {
       };
     }
 
-    const refundId = `REF-${Date.now()}-${Math.random()
-      .toString(36)
-      .substring(2, 6)
-      .toUpperCase()}`;
+    // v0.3：按订单号幂等。重复申请返回原工单，不新建、不覆盖原始退款原因
+    //（审计口径以首次为准）。进程内实现，v0.5 换 PG 唯一约束。
+    const { ticket, created } = getDefaultRefundStore().createIfAbsent({
+      orderId: params.orderId,
+      amount: order.totalAmount,
+      reason: params.reason,
+    });
+
+    const header = created
+      ? '退款申请已提交。'
+      : `该订单已经提交过退款申请，为您查询到原工单（未重复建单）。`;
 
     return {
       content:
-        '退款申请已提交。\n' +
-        `退款工单号: ${refundId}\n` +
-        `订单号: ${params.orderId}\n` +
-        `退款金额: ¥${order.totalAmount}\n` +
-        `退款原因: ${params.reason}\n` +
+        `${header}\n` +
+        `退款工单号: ${ticket.refundId}\n` +
+        `订单号: ${ticket.orderId}\n` +
+        `退款金额: ¥${ticket.amount}\n` +
+        `退款原因: ${ticket.reason}\n` +
         '预计 3-5 个工作日内处理完成，原路退回支付账户。',
       metadata: {
-        refundId,
-        orderId: params.orderId,
-        amount: order.totalAmount,
-        status: 'submitted',
+        refundId: ticket.refundId,
+        orderId: ticket.orderId,
+        amount: ticket.amount,
+        status: created ? 'submitted' : 'already_submitted',
+        duplicated: !created,
       },
     };
   },

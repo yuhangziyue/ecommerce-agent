@@ -204,7 +204,9 @@ describe('ContextManager.trimSafely', () => {
 
     const out = cm.trimSafely(messages);
 
-    const useIds = new Set(out.filter(m => m.toolUse).map(m => m.toolUse!.id));
+    const useIds = new Set(
+      out.filter(m => m.toolUses).flatMap(m => m.toolUses!.map(t => t.id))
+    );
     for (const m of out.filter(m => m.role === 'tool')) {
       expect(useIds.has(m.toolResult!.toolUseId)).toBe(true);
     }
