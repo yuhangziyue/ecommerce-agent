@@ -1,3 +1,0 @@
-{"type":"metadata","data":{"key":"created","value":{"timestamp":1786546273041}},"timestamp":1786546273041}
-{"type":"message","data":{"role":"user","content":"Hi","timestamp":1786546273042},"timestamp":1786546273042}
-{"type":"message","data":{"role":"assistant","content":"Hello!","timestamp":1786546273042},"timestamp":1786546273042}

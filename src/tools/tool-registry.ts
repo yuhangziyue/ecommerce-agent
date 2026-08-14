@@ -34,6 +34,29 @@ export class ToolRegistry {
     }));
   }
 
+  /**
+   * 只做参数校验，不执行。
+   *
+   * AgentLoop 需要「校验通过 → 高风险确认 → 才执行」这个顺序，
+   * 所以校验必须能独立于执行调用；否则确认弹窗会出现在参数都不合法的调用上。
+   */
+  validate(
+    name: string,
+    params: Record<string, unknown>
+  ): { ok: true } | { ok: false; error: string } {
+    const tool = this.tools.get(name);
+    if (!tool) {
+      return { ok: false, error: `Tool "${name}" not found` };
+    }
+
+    const validateFn = ajv.compile(tool.parameters);
+    if (!validateFn(params)) {
+      return { ok: false, error: ajv.errorsText(validateFn.errors) };
+    }
+
+    return { ok: true };
+  }
+
   /** Execute a tool by name with params, validates params against schema */
   async executeTool(name: string, params: Record<string, unknown>): Promise<ToolResult> {
     const tool = this.tools.get(name);

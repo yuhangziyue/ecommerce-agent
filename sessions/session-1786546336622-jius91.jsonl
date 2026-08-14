@@ -1,2 +1,0 @@
-{"type":"metadata","data":{"key":"created","value":{"timestamp":1786546336622}},"timestamp":1786546336622}
-{"type":"tool_call","data":{"toolUseId":"tc-001","toolName":"queryOrder","input":{"orderId":"ORD-001"}},"timestamp":1786546336622}
