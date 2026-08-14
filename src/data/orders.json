@@ -1,0 +1,121 @@
+[
+  {
+    "orderId": "ORD-20260801-001",
+    "phone": "13812341234",
+    "customerName": "张三",
+    "items": [{"name": "无线蓝牙耳机Pro", "quantity": 1, "price": 299}],
+    "totalAmount": 299,
+    "status": "shipped",
+    "createTime": "2026-08-01T10:00:00Z",
+    "tracking": {"company": "顺丰", "number": "SF1234567890"},
+    "address": "北京市朝阳区建国路88号"
+  },
+  {
+    "orderId": "ORD-20260802-002",
+    "phone": "13998765432",
+    "customerName": "李四",
+    "items": [{"name": "纯棉T恤-白色L码", "quantity": 2, "price": 89}],
+    "totalAmount": 178,
+    "status": "pending",
+    "createTime": "2026-08-02T14:30:00Z",
+    "tracking": null,
+    "address": "上海市浦东新区陆家嘴环路100号"
+  },
+  {
+    "orderId": "ORD-20260803-003",
+    "phone": "13711112222",
+    "customerName": "王五",
+    "items": [
+      {"name": "机械键盘K8", "quantity": 1, "price": 459},
+      {"name": "键盘手托", "quantity": 1, "price": 69}
+    ],
+    "totalAmount": 528,
+    "status": "paid",
+    "createTime": "2026-08-03T09:15:00Z",
+    "tracking": null,
+    "address": "广州市天河区天河路385号"
+  },
+  {
+    "orderId": "ORD-20260804-004",
+    "phone": "13600004444",
+    "customerName": "赵六",
+    "items": [{"name": "有机坚果礼盒", "quantity": 3, "price": 128}],
+    "totalAmount": 384,
+    "status": "shipped",
+    "createTime": "2026-08-04T11:20:00Z",
+    "tracking": {"company": "中通", "number": "ZT9876543210"},
+    "address": "深圳市南山区科技园南路"
+  },
+  {
+    "orderId": "ORD-20260805-005",
+    "phone": "13588889999",
+    "customerName": "孙七",
+    "items": [{"name": "运动跑鞋-黑色42码", "quantity": 1, "price": 399}],
+    "totalAmount": 399,
+    "status": "delivered",
+    "createTime": "2026-08-05T16:45:00Z",
+    "tracking": {"company": "京东物流", "number": "JD2026080512345"},
+    "address": "杭州市西湖区文三路500号"
+  },
+  {
+    "orderId": "ORD-20260806-006",
+    "phone": "13766665555",
+    "customerName": "周八",
+    "items": [
+      {"name": "进口咖啡豆-哥伦比亚", "quantity": 2, "price": 89},
+      {"name": "手冲咖啡壶", "quantity": 1, "price": 159}
+    ],
+    "totalAmount": 337,
+    "status": "shipped",
+    "createTime": "2026-08-06T08:00:00Z",
+    "tracking": {"company": "圆通", "number": "YT5566778899"},
+    "address": "成都市锦江区春熙路10号"
+  },
+  {
+    "orderId": "ORD-20260807-007",
+    "phone": "13844443333",
+    "customerName": "吴九",
+    "items": [{"name": "智能手环M6", "quantity": 1, "price": 199}],
+    "totalAmount": 199,
+    "status": "refunded",
+    "createTime": "2026-08-07T13:30:00Z",
+    "tracking": {"company": "顺丰", "number": "SF0987654321"},
+    "address": "武汉市武昌区中南路99号"
+  },
+  {
+    "orderId": "ORD-20260808-008",
+    "phone": "13922221111",
+    "customerName": "郑十",
+    "items": [{"name": "真丝衬衫-蓝色M码", "quantity": 1, "price": 569}],
+    "totalAmount": 569,
+    "status": "paid",
+    "createTime": "2026-08-08T10:10:00Z",
+    "tracking": null,
+    "address": "南京市鼓楼区中山北路200号"
+  },
+  {
+    "orderId": "ORD-20260809-009",
+    "phone": "13655556666",
+    "customerName": "冯十一",
+    "items": [{"name": "USB-C扩展坞", "quantity": 1, "price": 239}],
+    "totalAmount": 239,
+    "status": "pending",
+    "createTime": "2026-08-09T17:00:00Z",
+    "tracking": null,
+    "address": "重庆市渝中区解放碑步行街"
+  },
+  {
+    "orderId": "ORD-20260810-010",
+    "phone": "13733334444",
+    "customerName": "陈十二",
+    "items": [
+      {"name": "有机绿茶-西湖龙井", "quantity": 1, "price": 198},
+      {"name": "茶具套装", "quantity": 1, "price": 258}
+    ],
+    "totalAmount": 456,
+    "status": "delivered",
+    "createTime": "2026-08-10T09:30:00Z",
+    "tracking": {"company": "韵达", "number": "YD1122334455"},
+    "address": "西安市碑林区南大街1号"
+  }
+]

@@ -1,0 +1,182 @@
+[
+  {
+    "productId": "P001",
+    "name": "无线蓝牙耳机Pro",
+    "category": "电子产品",
+    "price": 299,
+    "stock": 156,
+    "description": "主动降噪，40小时续航，蓝牙5.3，支持多设备连接",
+    "rating": 4.7
+  },
+  {
+    "productId": "P002",
+    "name": "机械键盘K8",
+    "category": "电子产品",
+    "price": 459,
+    "stock": 83,
+    "description": "87键紧凑布局，Cherry红轴，RGB背光，铝合金机身",
+    "rating": 4.8
+  },
+  {
+    "productId": "P003",
+    "name": "智能手环M6",
+    "category": "电子产品",
+    "price": 199,
+    "stock": 230,
+    "description": "心率血氧监测，14天续航，50米防水，来电提醒",
+    "rating": 4.3
+  },
+  {
+    "productId": "P004",
+    "name": "USB-C扩展坞",
+    "category": "电子产品",
+    "price": 239,
+    "stock": 67,
+    "description": "12合1，支持4K@60Hz HDMI，100W PD充电，千兆网口",
+    "rating": 4.5
+  },
+  {
+    "productId": "P005",
+    "name": "便携蓝牙音箱",
+    "category": "电子产品",
+    "price": 169,
+    "stock": 120,
+    "description": "IPX7防水，20小时续航，TWS串联，低音增强",
+    "rating": 4.4
+  },
+  {
+    "productId": "P006",
+    "name": "无线充电板",
+    "category": "电子产品",
+    "price": 79,
+    "stock": 340,
+    "description": "15W快充，兼容Qi协议，超薄设计，LED指示灯",
+    "rating": 4.2
+  },
+  {
+    "productId": "P007",
+    "name": "纯棉T恤-白色",
+    "category": "服饰",
+    "price": 89,
+    "stock": 500,
+    "description": "100%新疆长绒棉，200g重磅，不透不缩水，S-3XL码",
+    "rating": 4.6
+  },
+  {
+    "productId": "P008",
+    "name": "真丝衬衫-蓝色",
+    "category": "服饰",
+    "price": 569,
+    "stock": 45,
+    "description": "100%桑蚕丝，商务休闲两穿，免烫处理，M-XXL码",
+    "rating": 4.7
+  },
+  {
+    "productId": "P009",
+    "name": "运动跑鞋-黑色",
+    "category": "服饰",
+    "price": 399,
+    "stock": 180,
+    "description": "轻量缓震，透气飞织鞋面，橡胶大底，39-45码",
+    "rating": 4.5
+  },
+  {
+    "productId": "P010",
+    "name": "羊绒围巾",
+    "category": "服饰",
+    "price": 329,
+    "stock": 90,
+    "description": "100%内蒙古羊绒，经典格纹，柔软亲肤，多色可选",
+    "rating": 4.8
+  },
+  {
+    "productId": "P011",
+    "name": "牛仔外套-复古蓝",
+    "category": "服饰",
+    "price": 349,
+    "stock": 75,
+    "description": "重磅水洗牛仔布，经典版型，秋冬百搭，S-XL码",
+    "rating": 4.4
+  },
+  {
+    "productId": "P012",
+    "name": "休闲运动裤",
+    "category": "服饰",
+    "price": 159,
+    "stock": 260,
+    "description": "弹力面料，束脚设计，拉链口袋，运动通勤两穿",
+    "rating": 4.3
+  },
+  {
+    "productId": "P013",
+    "name": "键盘手托",
+    "category": "电子产品",
+    "price": 69,
+    "stock": 150,
+    "description": "记忆棉材质，人体工学弧度，防滑底座，适配各尺寸键盘",
+    "rating": 4.1
+  },
+  {
+    "productId": "P014",
+    "name": "有机坚果礼盒",
+    "category": "食品",
+    "price": 128,
+    "stock": 200,
+    "description": "6种坚果混合，独立小包装，0添加，年货送礼佳品",
+    "rating": 4.6
+  },
+  {
+    "productId": "P015",
+    "name": "进口咖啡豆-哥伦比亚",
+    "category": "食品",
+    "price": 89,
+    "stock": 160,
+    "description": "100%阿拉比卡，中度烘焙，坚果巧克力风味，250g/袋",
+    "rating": 4.7
+  },
+  {
+    "productId": "P016",
+    "name": "有机绿茶-西湖龙井",
+    "category": "食品",
+    "price": 198,
+    "stock": 80,
+    "description": "明前特级，西湖核心产区，手工炒制，罐装100g",
+    "rating": 4.9
+  },
+  {
+    "productId": "P017",
+    "name": "手冲咖啡壶",
+    "category": "食品",
+    "price": 159,
+    "stock": 95,
+    "description": "耐热玻璃壶身，不锈钢滤网，600ml容量，附量勺",
+    "rating": 4.4
+  },
+  {
+    "productId": "P018",
+    "name": "茶具套装",
+    "category": "食品",
+    "price": 258,
+    "stock": 55,
+    "description": "青瓷一壶六杯，含茶盘，中式复古风格，礼盒装",
+    "rating": 4.8
+  },
+  {
+    "productId": "P019",
+    "name": "蜂蜜柚子茶",
+    "category": "食品",
+    "price": 39,
+    "stock": 400,
+    "description": "韩式工艺，真实柚子果肉，冲饮/烘焙两用，500g/瓶",
+    "rating": 4.2
+  },
+  {
+    "productId": "P020",
+    "name": "黑巧克力礼盒",
+    "category": "食品",
+    "price": 168,
+    "stock": 110,
+    "description": "72%可可含量，比利时原料，12片独立装，低糖配方",
+    "rating": 4.5
+  }
+]

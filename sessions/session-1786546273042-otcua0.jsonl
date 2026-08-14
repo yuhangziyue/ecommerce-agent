@@ -1,0 +1,4 @@
+{"type":"metadata","data":{"key":"created","value":{"timestamp":1786546273042}},"timestamp":1786546273042}
+{"type":"message","data":{"role":"user","content":"test","timestamp":1786546273043},"timestamp":1786546273043}
+{"type":"tool_call","data":{"toolUseId":"tc-1","toolName":"tool","input":{}},"timestamp":1786546273043}
+{"type":"tool_result","data":{"toolUseId":"tc-1","result":{"content":"ok"},"durationMs":10},"timestamp":1786546273043}

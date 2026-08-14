@@ -1,0 +1,3 @@
+{"type":"metadata","data":{"key":"created","value":{"timestamp":1786546336623}},"timestamp":1786546336623}
+{"type":"message","data":{"role":"user","content":"hi","timestamp":1786546336623},"timestamp":1786546336623}
+{"type":"tool_call","data":{"toolUseId":"tc-x","toolName":"search","input":{"q":"test"}},"timestamp":1786546336623}
