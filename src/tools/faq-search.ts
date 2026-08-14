@@ -1,59 +1,65 @@
-import { AgentTool, ToolResult } from '../core/types.js';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import { Type, type Static } from '@sinclair/typebox';
+import type { AgentTool, ToolResult } from '../core/types.js';
+import { loadFaqs } from '../data/loader.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const MAX_RESULTS = 3;
 
-function loadFaqs(): any[] {
-  const dataPath = path.join(__dirname, '..', 'data', 'faqs.json');
-  return JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
-}
+/** 命中不同字段的权重：标题命中最相关，正文次之，分类命中作为兜底信号 */
+const WEIGHT = { question: 3, answer: 1, category: 2 } as const;
 
-export const faqSearchTool: AgentTool = {
+const FaqSearchParams = Type.Object({
+  query: Type.String({
+    description:
+      '搜索关键词，如 退换货 / 配送 / 支付 / 会员 / 发票 / 优惠券 / 订单 / 客服',
+  }),
+});
+type FaqSearchParams = Static<typeof FaqSearchParams>;
+
+export const faqSearchTool: AgentTool<typeof FaqSearchParams> = {
   name: 'faq_search',
-  description: '搜索常见问题解答',
-  parameters: {
-    type: 'object',
-    properties: {
-      query: { type: 'string', description: '搜索关键词' },
-    },
-    required: ['query'],
-  },
+  description:
+    `搜索平台常见问题解答，按相关度返回最相关的 ${MAX_RESULTS} 条。` +
+    '当客户询问规则类问题（退换货政策、配送时效、支付方式、会员权益、发票、优惠活动）时' +
+    '优先调用，用标准答案回复，不要凭记忆作答。',
+  parameters: FaqSearchParams,
   riskLevel: 'low',
-  execute: async (params: { query: string }): Promise<ToolResult> => {
+  execute: async (params: FaqSearchParams): Promise<ToolResult> => {
     const faqs = loadFaqs();
     const query = params.query.toLowerCase();
 
-    // Score each FAQ by keyword match count
-    const scored = faqs.map((faq: any) => {
+    const scored = faqs.map((faq) => {
       let score = 0;
-      if (faq.question.toLowerCase().includes(query)) score += 3;
-      if (faq.answer.toLowerCase().includes(query)) score += 1;
-      if (faq.category && query.includes(faq.category.toLowerCase())) score += 2;
+      if (faq.question.toLowerCase().includes(query)) score += WEIGHT.question;
+      if (faq.answer.toLowerCase().includes(query)) score += WEIGHT.answer;
+      if (faq.category && query.includes(faq.category.toLowerCase())) {
+        score += WEIGHT.category;
+      }
       return { faq, score };
     });
 
-    // Filter and sort by score, take top 3
     const results = scored
-      .filter((s: any) => s.score > 0)
-      .sort((a: any, b: any) => b.score - a.score)
-      .slice(0, 3);
+      .filter((s) => s.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, MAX_RESULTS);
 
     if (results.length === 0) {
       return {
-        content: '没有找到相关的常见问题。建议您联系人工客服获取帮助，或尝试用不同的关键词搜索。',
+        content:
+          '没有找到相关的常见问题。建议换个关键词，或转人工客服获取帮助。',
         isError: false,
       };
     }
 
     const formatted = results
-      .map((r: any) => `Q: ${r.faq.question}\nA: ${r.faq.answer}`)
+      .map((r) => `Q: ${r.faq.question}\nA: ${r.faq.answer}`)
       .join('\n---\n');
 
     return {
       content: formatted,
-      metadata: { count: results.length, faqIds: results.map((r: any) => r.faq.id) },
+      metadata: {
+        count: results.length,
+        faqIds: results.map((r) => r.faq.id),
+      },
     };
   },
 };

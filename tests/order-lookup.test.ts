@@ -6,7 +6,9 @@ describe('orderLookupTool', () => {
 
     expect(result.isError).toBeUndefined();
     expect(result.content).toContain('张三');
-    expect(result.content).toContain('shipped');
+    // v0.2：状态改为中文标签（从 index.ts 内联工具移植的映射）。
+    // 断言应表达期望行为，而不是固化「把 shipped 原样丢给模型」这个不佳实现。
+    expect(result.content).toContain('已发货，运输中');
     expect(result.content).toContain('顺丰');
     expect(result.content).toContain('SF1234567890');
   });
