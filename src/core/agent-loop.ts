@@ -8,10 +8,24 @@ import type { TrajectoryLogger } from '../evaluation/trajectory-logger.js';
 import type {
   AgentConfig,
   AgentEvent,
+  AgentTool,
   ChatProvider,
   Message,
   ToolResult,
+  ToolUse,
 } from './types.js';
+
+/**
+ * 单个工具调用的执行计划。
+ * 先把「查找 + 校验 + 确认」全部算完再执行，是为了让高风险确认能串行、其余能并发。
+ */
+interface ToolPlan {
+  toolUse: ToolUse;
+  tool?: AgentTool;
+  /** 非空表示这个调用不进入执行阶段（工具不存在 / 参数不合法 / 用户拒绝） */
+  error?: ToolResult;
+  durationMs?: number;
+}
 
 export type EventHandler = (event: AgentEvent) => void;
 export type ConfirmHandler = (
@@ -129,19 +143,16 @@ export class AgentLoop {
       this.tracker.add(response.usage, this.config.model);
 
       // ── 情况 A：纯文本回复，本轮收口 ──
-      if (response.content && !response.toolUse) {
+      if (response.content && response.toolUses.length === 0) {
         return await this.finishTurn(ctx, response.content, toolsUsed);
       }
 
-      // ── 情况 B：工具调用 ──
-      if (response.toolUse) {
-        const toolUse = response.toolUse;
-        const tool = this.registry.get(toolUse.name);
-
+      // ── 情况 B：工具调用（可能是多个，Claude 默认开启 parallel tool use）──
+      if (response.toolUses.length > 0) {
         const assistantMessage: Message = {
           role: 'assistant',
           content: response.content || '',
-          toolUse,
+          toolUses: response.toolUses,
           timestamp: Date.now(),
         };
         this.conversationMessages.push(assistantMessage);
@@ -151,67 +162,7 @@ export class AgentLoop {
           this.emit({ type: 'thinking', content: response.content });
         }
 
-        if (!tool) {
-          this.pushToolResult(toolUse.id, {
-            content:
-              `工具 "${toolUse.name}" 不存在。可用工具: ` +
-              this.registry
-                .getAll()
-                .map((t) => t.name)
-                .join(', '),
-            isError: true,
-          });
-          continue;
-        }
-
-        const validation = this.registry.validate(toolUse.name, toolUse.input);
-        if (!validation.ok) {
-          this.pushToolResult(toolUse.id, {
-            content: `参数校验失败: ${validation.error}`,
-            isError: true,
-          });
-          continue;
-        }
-
-        if (tool.riskLevel === 'high' && this.config.confirmHighRisk) {
-          const confirmed = await this.onConfirm(toolUse.name, toolUse.input);
-          if (!confirmed) {
-            this.pushToolResult(toolUse.id, {
-              content: '用户取消了该操作。',
-              isError: false,
-            });
-            continue;
-          }
-        }
-
-        this.emit({
-          type: 'tool_start',
-          toolName: toolUse.name,
-          input: toolUse.input,
-        });
-        this.session.appendToolCall({
-          toolUseId: toolUse.id,
-          toolName: toolUse.name,
-          input: toolUse.input,
-        });
-
-        const startTime = Date.now();
-        let result: ToolResult;
-        try {
-          result = await tool.execute(toolUse.input);
-        } catch (err: any) {
-          result = { content: `工具执行出错: ${err.message}`, isError: true };
-        }
-        const durationMs = Date.now() - startTime;
-
-        toolsUsed.push(toolUse.name);
-        this.emit({
-          type: 'tool_end',
-          toolName: toolUse.name,
-          result,
-          durationMs,
-        });
-        this.pushToolResult(toolUse.id, result, durationMs);
+        await this.executeToolUses(response.toolUses, toolsUsed);
         continue;
       }
 
@@ -227,6 +178,107 @@ export class AgentLoop {
     this.emit({ type: 'error', error: maxTurnMsg });
     this.emitDone();
     return maxTurnMsg;
+  }
+
+  /**
+   * 执行一次响应里的全部工具调用，四个阶段：
+   *
+   * 1. **全量规划**（查找 + 参数校验）—— 不合法的调用不进入执行阶段
+   * 2. **串行确认**高风险工具 —— 同时弹三个确认框，用户不知道自己在批准什么
+   * 3. **并发执行**其余工具 —— 三个互不依赖的查询工具串行是三倍延迟
+   * 4. **按原序回喂**结果 —— 顺序错乱会让模型把结果配错工具
+   *
+   * 不变量：**每个 tool_use 必须产生恰好一条 tool 结果消息**（包括失败与被拒的），
+   * 否则下一轮请求会因缺少配对被 API 拒绝。
+   */
+  private async executeToolUses(
+    toolUses: ToolUse[],
+    toolsUsed: string[]
+  ): Promise<void> {
+    // 阶段 1：全量规划
+    const plans: ToolPlan[] = toolUses.map((toolUse) => {
+      const tool = this.registry.get(toolUse.name);
+      if (!tool) {
+        return {
+          toolUse,
+          error: {
+            content:
+              `工具 "${toolUse.name}" 不存在。可用工具: ` +
+              this.registry
+                .getAll()
+                .map((t) => t.name)
+                .join(', '),
+            isError: true,
+          },
+        };
+      }
+
+      const validation = this.registry.validate(toolUse.name, toolUse.input);
+      if (!validation.ok) {
+        return {
+          toolUse,
+          error: {
+            content: `参数校验失败: ${validation.error}`,
+            isError: true,
+          },
+        };
+      }
+
+      return { toolUse, tool };
+    });
+
+    // 阶段 2：高风险串行确认
+    for (const plan of plans) {
+      if (plan.error || !plan.tool) continue;
+      if (plan.tool.riskLevel === 'high' && this.config.confirmHighRisk) {
+        const confirmed = await this.onConfirm(plan.toolUse.name, plan.toolUse.input);
+        if (!confirmed) {
+          plan.error = { content: '用户取消了该操作。', isError: false };
+        }
+      }
+    }
+
+    // 阶段 3：并发执行（Promise.all 按输入顺序返回，天然保序）
+    const results = await Promise.all(
+      plans.map(async (plan): Promise<ToolResult> => {
+        if (plan.error) return plan.error;
+
+        const tool = plan.tool!;
+        this.emit({
+          type: 'tool_start',
+          toolName: plan.toolUse.name,
+          input: plan.toolUse.input,
+        });
+        this.session.appendToolCall({
+          toolUseId: plan.toolUse.id,
+          toolName: plan.toolUse.name,
+          input: plan.toolUse.input,
+        });
+
+        const startTime = Date.now();
+        let result: ToolResult;
+        try {
+          result = await tool.execute(plan.toolUse.input);
+        } catch (err: any) {
+          result = { content: `工具执行出错: ${err.message}`, isError: true };
+        }
+        plan.durationMs = Date.now() - startTime;
+
+        this.emit({
+          type: 'tool_end',
+          toolName: plan.toolUse.name,
+          result,
+          durationMs: plan.durationMs,
+        });
+        return result;
+      })
+    );
+
+    // 阶段 4：按原序回喂
+    plans.forEach((plan, i) => {
+      if (!plan.error) toolsUsed.push(plan.toolUse.name);
+      this.pushToolResult(plan.toolUse.id, results[i], plan.durationMs ?? 0);
+    });
   }
 
   /**

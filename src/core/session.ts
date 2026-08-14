@@ -55,10 +55,41 @@ export class Session {
     return [...this.entries];
   }
 
+  /**
+   * 把完整事件流**投影**成对话消息序列。
+   *
+   * v0.3 之前这里是 `entries.filter(e => e.type === 'message')` —— 那是**过滤**，
+   * 而工具结果走的是 `appendToolResult()` 写入的 `tool_result` entry，被整段漏掉。
+   * 后果：落盘序列里有带 `toolUses` 的 assistant 消息，却没有对应的 tool 结果消息，
+   * `restore()` 出来的历史因 tool_use 缺少配对的 tool_result 必被 API 拒绝。
+   *
+   * 投影规则：
+   * - `message`     → 原样
+   * - `tool_result` → 合成一条 role:'tool' 消息（此前丢失的部分）
+   * - `tool_call`   → 跳过（信息已包含在 assistant 消息的 toolUses 里，重复投影会双计）
+   * - `metadata`    → 跳过（不是对话内容）
+   */
   getMessages(): Message[] {
-    return this.entries
-      .filter((e) => e.type === 'message')
-      .map((e) => e.data as Message);
+    const messages: Message[] = [];
+
+    for (const entry of this.entries) {
+      if (entry.type === 'message') {
+        messages.push(entry.data as Message);
+      } else if (entry.type === 'tool_result') {
+        const toolResult = entry.data as ToolResultEntry;
+        messages.push({
+          role: 'tool',
+          content: toolResult.result.content,
+          toolResult: {
+            toolUseId: toolResult.toolUseId,
+            result: toolResult.result,
+          },
+          timestamp: entry.timestamp,
+        });
+      }
+    }
+
+    return messages;
   }
 
   appendMessage(message: Message): void {

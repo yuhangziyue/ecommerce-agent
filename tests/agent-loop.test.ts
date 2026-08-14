@@ -40,7 +40,7 @@ class FakeProvider implements ChatProvider {
 const usage = { inputTokens: 10, outputTokens: 5 };
 
 function textReply(content: string): ChatResponse {
-  return { content, usage, stopReason: 'end_turn' };
+  return { content, toolUses: [], usage, stopReason: 'end_turn' };
 }
 
 function toolReply(
@@ -50,7 +50,24 @@ function toolReply(
 ): ChatResponse {
   return {
     content: thinking,
-    toolUse: { id: `tu_${name}`, name, input },
+    toolUses: [{ id: `tu_${name}`, name, input }],
+    usage,
+    stopReason: 'tool_use',
+  };
+}
+
+/** 一次响应发起多个工具调用（Claude 默认开启 parallel tool use） */
+function multiToolReply(
+  specs: Array<[string, Record<string, unknown>]>,
+  thinking = ''
+): ChatResponse {
+  return {
+    content: thinking,
+    toolUses: specs.map(([name, input], i) => ({
+      id: `tu_${i}_${name}`,
+      name,
+      input,
+    })),
     usage,
     stopReason: 'tool_use',
   };
@@ -426,6 +443,220 @@ describe('AgentLoop · 中间件接线（v0.2 核心验收）', () => {
   });
 });
 
+describe('AgentLoop · 并行工具调用（v0.3 核心验收）', () => {
+  it('一次响应含 3 个 tool_use 时全部执行，结果按原顺序回喂', async () => {
+    const executed: string[] = [];
+    const tools = ['t1', 't2', 't3'].map((n) =>
+      mockTool({
+        name: n,
+        execute: async () => {
+          executed.push(n);
+          return { content: `result_${n}` };
+        },
+      })
+    );
+
+    const h = harness({
+      script: [
+        multiToolReply([
+          ['t1', { text: 'a' }],
+          ['t2', { text: 'b' }],
+          ['t3', { text: 'c' }],
+        ]),
+        textReply('三个都查完了'),
+      ],
+      tools,
+    });
+
+    const reply = await h.loop.run('并行查三样');
+
+    expect(reply).toBe('三个都查完了');
+    expect(executed.sort()).toEqual(['t1', 't2', 't3']);
+
+    // 结果保序：喂回模型的 tool 消息顺序必须与 tool_use 顺序一致，
+    // 否则模型会把结果配错工具
+    const toolMsgs = h.session.getMessages().filter((m) => m.role === 'tool');
+    expect(toolMsgs.map((m) => m.content)).toEqual([
+      'result_t1',
+      'result_t2',
+      'result_t3',
+    ]);
+  });
+
+  it('低风险工具并发执行：第二个在第一个完成前就已启动（串行则死锁）', async () => {
+    const started: string[] = [];
+    let releaseA!: () => void;
+    const gateA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+
+    const toolA = mockTool({
+      name: 'tool_a',
+      execute: async () => {
+        started.push('a');
+        await gateA; // 只有 tool_b 启动后才会被放行
+        return { content: 'A' };
+      },
+    });
+    const toolB = mockTool({
+      name: 'tool_b',
+      execute: async () => {
+        started.push('b');
+        releaseA();
+        return { content: 'B' };
+      },
+    });
+
+    const h = harness({
+      script: [
+        multiToolReply([
+          ['tool_a', { text: 'x' }],
+          ['tool_b', { text: 'y' }],
+        ]),
+        textReply('并发完成'),
+      ],
+      tools: [toolA, toolB],
+    });
+
+    // 若实现是串行的，tool_a 会永远等 gateA，此处超时失败
+    const reply = await h.loop.run('并发');
+
+    expect(reply).toBe('并发完成');
+    expect(started).toEqual(['a', 'b']);
+  });
+
+  it('高风险工具串行逐个确认（不同时弹多个确认框）', async () => {
+    const confirmOrder: string[] = [];
+    const h = harness({
+      script: [
+        multiToolReply([
+          ['risky_1', { text: 'a' }],
+          ['risky_2', { text: 'b' }],
+          ['safe_1', { text: 'c' }],
+        ]),
+        textReply('都处理了'),
+      ],
+      tools: [
+        mockTool({ name: 'risky_1', riskLevel: 'high' }),
+        mockTool({ name: 'risky_2', riskLevel: 'high' }),
+        mockTool({ name: 'safe_1', riskLevel: 'low' }),
+      ],
+    });
+
+    // 覆盖 harness 的 onConfirm 以记录顺序
+    const loop = new AgentLoop({
+      config: config(),
+      registry: registryWith(
+        mockTool({ name: 'risky_1', riskLevel: 'high' }),
+        mockTool({ name: 'risky_2', riskLevel: 'high' }),
+        mockTool({ name: 'safe_1', riskLevel: 'low' })
+      ),
+      session: Session.create(),
+      provider: h.provider,
+      onConfirm: async (name) => {
+        confirmOrder.push(name);
+        return true;
+      },
+    });
+
+    await loop.run('混合');
+
+    expect(confirmOrder).toEqual(['risky_1', 'risky_2']); // 只问高风险，且按序
+  });
+
+  it('高风险被拒时其余工具仍执行，且每个 tool_use 都有配对结果', async () => {
+    let riskyExecuted = false;
+    const safeExecuted: string[] = [];
+
+    const h = harness({
+      script: [
+        multiToolReply([
+          ['risky', { text: 'a' }],
+          ['safe_1', { text: 'b' }],
+          ['safe_2', { text: 'c' }],
+        ]),
+        textReply('部分完成'),
+      ],
+      tools: [
+        mockTool({
+          name: 'risky',
+          riskLevel: 'high',
+          execute: async () => {
+            riskyExecuted = true;
+            return { content: 'should not run' };
+          },
+        }),
+        mockTool({
+          name: 'safe_1',
+          execute: async () => {
+            safeExecuted.push('safe_1');
+            return { content: 'S1' };
+          },
+        }),
+        mockTool({
+          name: 'safe_2',
+          execute: async () => {
+            safeExecuted.push('safe_2');
+            return { content: 'S2' };
+          },
+        }),
+      ],
+      confirm: false,
+    });
+
+    const reply = await h.loop.run('混合');
+
+    expect(reply).toBe('部分完成');
+    expect(riskyExecuted).toBe(false);
+    expect(safeExecuted.sort()).toEqual(['safe_1', 'safe_2']);
+
+    // 配对不变量：3 个 tool_use → 必须 3 条 tool 结果消息
+    const toolMsgs = h.session.getMessages().filter((m) => m.role === 'tool');
+    expect(toolMsgs).toHaveLength(3);
+    expect(toolMsgs[0].content).toContain('用户取消');
+  });
+
+  it('部分工具不存在时，存在的仍执行，每个 tool_use 仍有配对结果', async () => {
+    const h = harness({
+      script: [
+        multiToolReply([
+          ['echo_tool', { text: 'ok' }],
+          ['ghost_tool', {}],
+        ]),
+        textReply('已处理'),
+      ],
+    });
+
+    await h.loop.run('混合');
+
+    const toolMsgs = h.session.getMessages().filter((m) => m.role === 'tool');
+    expect(toolMsgs).toHaveLength(2);
+    expect(toolMsgs[0].content).toBe('echo: ok');
+    expect(toolMsgs[1].content).toContain('不存在');
+  });
+
+  it('assistant 消息记录全部 toolUses（不再只留最后一个）', async () => {
+    const h = harness({
+      script: [
+        multiToolReply([
+          ['t1', { text: 'a' }],
+          ['t2', { text: 'b' }],
+        ]),
+        textReply('ok'),
+      ],
+      tools: [mockTool({ name: 't1' }), mockTool({ name: 't2' })],
+    });
+
+    await h.loop.run('并行');
+
+    const assistantWithTools = h.session
+      .getMessages()
+      .find((m) => m.role === 'assistant' && m.toolUses);
+    expect(assistantWithTools!.toolUses).toHaveLength(2);
+    expect(assistantWithTools!.toolUses!.map((t) => t.name)).toEqual(['t1', 't2']);
+  });
+});
+
 describe('AgentLoop · 循环边界', () => {
   it('达到 maxTurns 时返回上限提示并 emit error', async () => {
     const h = harness({
@@ -445,7 +676,7 @@ describe('AgentLoop · 循环边界', () => {
 
   it('模型既无文本也无工具调用时返回兜底话术', async () => {
     const h = harness({
-      script: [{ content: '', usage, stopReason: 'end_turn' }],
+      script: [{ content: '', toolUses: [], usage, stopReason: 'end_turn' }],
     });
     const reply = await h.loop.run('你好');
     expect(reply).toContain('抱歉');

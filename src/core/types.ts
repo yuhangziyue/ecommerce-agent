@@ -20,7 +20,12 @@ export type Role = 'user' | 'assistant' | 'system' | 'tool';
 export interface Message {
   role: Role;
   content: string;
-  toolUse?: ToolUse;
+  /**
+   * 一个 assistant 轮次可以发起**多个**工具调用（Claude 默认开启 parallel tool use）。
+   * v0.3 从单数 `toolUse` 改为复数：此前只保留最后一个，其余静默丢弃，
+   * 导致下一轮请求因 tool_use 缺少配对的 tool_result 被 API 拒绝，整轮对话中断。
+   */
+  toolUses?: ToolUse[];
   toolResult?: { toolUseId: string; result: ToolResult };
   timestamp: number;
 }
@@ -96,7 +101,8 @@ export type AgentEvent =
 /** 一次模型调用的归一化结果，屏蔽具体 SDK 的响应形态 */
 export interface ChatResponse {
   content: string;
-  toolUse?: ToolUse;
+  /** 恒为数组（可能为空），不用可选字段 —— 避免调用方漏判 undefined 而丢块 */
+  toolUses: ToolUse[];
   usage: TokenUsage;
   stopReason: string;
 }

@@ -114,7 +114,7 @@ function toolUseMsg(id: string): Message {
   return {
     role: 'assistant',
     content: '',
-    toolUse: { id, name: 'order_lookup', input: {} },
+    toolUses: [{ id, name: 'order_lookup', input: {} }],
     timestamp: Date.now(),
   };
 }
@@ -167,7 +167,7 @@ describe('ContextManager.trimSafely', () => {
     expect(out[0].role).toBe('user');
     // 整轮完整保留：tool_use 与 tool_result 仍成对
     expect(out).toHaveLength(3);
-    expect(out[1].toolUse!.id).toBe('tu_1');
+    expect(out[1].toolUses![0].id).toBe('tu_1');
     expect(out[2].toolResult!.toolUseId).toBe('tu_1');
   });
 

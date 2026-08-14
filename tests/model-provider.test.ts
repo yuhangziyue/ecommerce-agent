@@ -1,9 +1,65 @@
 import {
   messagesToAnthropicFormat,
   toolToAnthropicSchema,
+  parseAnthropicResponse,
 } from '../src/core/model-provider.js';
 import type { Message } from '../src/core/types.js';
 import { orderLookupTool } from '../src/tools/order-lookup.js';
+
+describe('parseAnthropicResponse', () => {
+  const usage = { input_tokens: 10, output_tokens: 5 };
+
+  it('纯文本响应', () => {
+    const parsed = parseAnthropicResponse({
+      content: [{ type: 'text', text: '您好' }],
+      usage,
+      stop_reason: 'end_turn',
+    } as never);
+    expect(parsed.content).toBe('您好');
+    expect(parsed.toolUses).toEqual([]);
+    expect(parsed.stopReason).toBe('end_turn');
+  });
+
+  it('多个 tool_use 块全部被收集（v0.3 修复：此前后者覆盖前者，只剩最后一个）', () => {
+    const parsed = parseAnthropicResponse({
+      content: [
+        { type: 'text', text: '我来查两样' },
+        { type: 'tool_use', id: 'tu_1', name: 'order_lookup', input: { orderId: 'A' } },
+        { type: 'tool_use', id: 'tu_2', name: 'product_search', input: { keyword: 'B' } },
+        { type: 'tool_use', id: 'tu_3', name: 'faq_search', input: { query: 'C' } },
+      ],
+      usage,
+      stop_reason: 'tool_use',
+    } as never);
+
+    expect(parsed.toolUses.map((t) => t.id)).toEqual(['tu_1', 'tu_2', 'tu_3']);
+    expect(parsed.toolUses.map((t) => t.name)).toEqual([
+      'order_lookup',
+      'product_search',
+      'faq_search',
+    ]);
+    expect(parsed.content).toBe('我来查两样');
+  });
+
+  it('usage 与缓存字段被透传', () => {
+    const parsed = parseAnthropicResponse({
+      content: [],
+      usage: {
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_read_input_tokens: 50,
+        cache_creation_input_tokens: 10,
+      },
+      stop_reason: 'end_turn',
+    } as never);
+    expect(parsed.usage).toEqual({
+      inputTokens: 100,
+      outputTokens: 20,
+      cacheReadTokens: 50,
+      cacheWriteTokens: 10,
+    });
+  });
+});
 
 describe('messagesToAnthropicFormat', () => {
   it('user 消息原样转为字符串内容', () => {
@@ -13,12 +69,12 @@ describe('messagesToAnthropicFormat', () => {
     expect(out).toEqual([{ role: 'user', content: '查订单' }]);
   });
 
-  it('assistant 带 toolUse 时产出 tool_use 块，且无空 text 块', () => {
+  it('assistant 带 toolUses 时产出 tool_use 块，且无空 text 块', () => {
     const out = messagesToAnthropicFormat([
       {
         role: 'assistant',
         content: '',
-        toolUse: { id: 'tu_1', name: 'order_lookup', input: { orderId: 'A' } },
+        toolUses: [{ id: 'tu_1', name: 'order_lookup', input: { orderId: 'A' } }],
         timestamp: 1,
       },
     ]);
@@ -31,17 +87,33 @@ describe('messagesToAnthropicFormat', () => {
     });
   });
 
-  it('assistant 同时有文本和 toolUse 时产出 text + tool_use 两块', () => {
+  it('assistant 同时有文本和 toolUses 时产出 text + tool_use', () => {
     const out = messagesToAnthropicFormat([
       {
         role: 'assistant',
         content: '我来查一下',
-        toolUse: { id: 'tu_1', name: 'order_lookup', input: {} },
+        toolUses: [{ id: 'tu_1', name: 'order_lookup', input: {} }],
         timestamp: 1,
       },
     ]);
     const blocks = out[0].content as Array<{ type: string }>;
     expect(blocks.map((b) => b.type)).toEqual(['text', 'tool_use']);
+  });
+
+  it('assistant 的多个 toolUses 全部转为 tool_use 块并保序', () => {
+    const out = messagesToAnthropicFormat([
+      {
+        role: 'assistant',
+        content: '',
+        toolUses: [
+          { id: 'tu_1', name: 'a', input: {} },
+          { id: 'tu_2', name: 'b', input: {} },
+        ],
+        timestamp: 1,
+      },
+    ]);
+    const blocks = out[0].content as Array<{ type: string; id: string }>;
+    expect(blocks.map((b) => b.id)).toEqual(['tu_1', 'tu_2']);
   });
 
   it('tool 角色消息转为带 tool_result 的 user 消息（API 要求的配对形态）', () => {
@@ -50,7 +122,7 @@ describe('messagesToAnthropicFormat', () => {
       {
         role: 'assistant',
         content: '',
-        toolUse: { id: 'tu_1', name: 'order_lookup', input: {} },
+        toolUses: [{ id: 'tu_1', name: 'order_lookup', input: {} }],
         timestamp: 2,
       },
       {
@@ -68,6 +140,82 @@ describe('messagesToAnthropicFormat', () => {
       tool_use_id: 'tu_1',
       content: '订单已发货',
     });
+  });
+
+  it('v0.3 关键：连续的 tool 消息合并成一条 user 消息', () => {
+    // 拆成多条 user 消息发出会训练模型停止做并行调用 —— 性能收益被自己作废
+    const out = messagesToAnthropicFormat([
+      { role: 'user', content: 'q', timestamp: 1 },
+      {
+        role: 'assistant',
+        content: '',
+        toolUses: [
+          { id: 'tu_1', name: 'a', input: {} },
+          { id: 'tu_2', name: 'b', input: {} },
+        ],
+        timestamp: 2,
+      },
+      {
+        role: 'tool',
+        content: 'r1',
+        toolResult: { toolUseId: 'tu_1', result: { content: 'r1' } },
+        timestamp: 3,
+      },
+      {
+        role: 'tool',
+        content: 'r2',
+        toolResult: { toolUseId: 'tu_2', result: { content: 'r2' } },
+        timestamp: 4,
+      },
+    ]);
+
+    expect(out).toHaveLength(3); // user / assistant / user(合并两个结果)
+    expect(out[1].content as unknown[]).toHaveLength(2); // 2×tool_use
+    const merged = out[2].content as Array<{ type: string; tool_use_id: string }>;
+    expect(merged).toHaveLength(2);
+    expect(merged.map((b) => b.tool_use_id)).toEqual(['tu_1', 'tu_2']);
+  });
+
+  it('多轮的 tool 结果各自成组，不跨轮合并', () => {
+    const out = messagesToAnthropicFormat([
+      { role: 'user', content: 'q1', timestamp: 1 },
+      {
+        role: 'assistant',
+        content: '',
+        toolUses: [{ id: 'tu_1', name: 'a', input: {} }],
+        timestamp: 2,
+      },
+      {
+        role: 'tool',
+        content: 'r1',
+        toolResult: { toolUseId: 'tu_1', result: { content: 'r1' } },
+        timestamp: 3,
+      },
+      { role: 'assistant', content: '好了', timestamp: 4 },
+      { role: 'user', content: 'q2', timestamp: 5 },
+      {
+        role: 'assistant',
+        content: '',
+        toolUses: [{ id: 'tu_2', name: 'b', input: {} }],
+        timestamp: 6,
+      },
+      {
+        role: 'tool',
+        content: 'r2',
+        toolResult: { toolUseId: 'tu_2', result: { content: 'r2' } },
+        timestamp: 7,
+      },
+    ]);
+
+    const toolResultGroups = out.filter(
+      (m) =>
+        Array.isArray(m.content) &&
+        (m.content as Array<{ type: string }>)[0]?.type === 'tool_result'
+    );
+    expect(toolResultGroups).toHaveLength(2);
+    expect(toolResultGroups.every((g) => (g.content as unknown[]).length === 1)).toBe(
+      true
+    );
   });
 
   it('工具报错时 tool_result 携带 is_error', () => {
