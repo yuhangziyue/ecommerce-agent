@@ -19,7 +19,9 @@ export class BudgetGuard {
 
   /** Check if operation is allowed within budget */
   check(): BudgetCheckResult {
-    const totalTokens = this.tokenTracker.getTotalTokens();
+    // 用 getConsumedTokens（含缓存 token）而非 getTotalTokens ——
+    // 后者漏算缓存，跑在大缓存前缀上的会话永远不会触发熔断
+    const totalTokens = this.tokenTracker.getConsumedTokens();
     const utilization = this.maxTokens > 0 ? totalTokens / this.maxTokens : 1;
 
     if (utilization >= 1.0) {

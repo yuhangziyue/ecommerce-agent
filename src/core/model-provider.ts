@@ -41,8 +41,10 @@ export function parseAnthropicResponse(
   const usage: TokenUsage = {
     inputTokens: response.usage.input_tokens,
     outputTokens: response.usage.output_tokens,
-    cacheReadTokens: (response.usage as any).cache_read_input_tokens,
-    cacheWriteTokens: (response.usage as any).cache_creation_input_tokens,
+    // SDK 声明是 `number | null`，我方是 `number | undefined` —— v0.7 之前用
+    // `as any` 把 null 抹掉了，等于类型在说谎。这里显式归一。
+    cacheReadTokens: response.usage.cache_read_input_tokens ?? undefined,
+    cacheWriteTokens: response.usage.cache_creation_input_tokens ?? undefined,
   };
 
   let textContent = '';

@@ -22,6 +22,14 @@ export interface PriceWindow {
   until?: string;
   input: number;
   output: number;
+  /**
+   * 缓存读取价（USD / 1M tokens）。缺省 = `input × 0.1`。
+   * v0.7 之前**完全没有计价** —— cache read/write 的成本恒为 $0，
+   * 而 v0.11 的多租户账本要以这张表为基础。
+   */
+  cacheRead?: number;
+  /** 缓存写入价。缺省 = `input × 1.25`（5 分钟 TTL；1 小时 TTL 是 2×） */
+  cacheWrite?: number;
 }
 
 /**
@@ -170,9 +178,15 @@ export class TokenTracker {
       (this.totalUsage.cacheWriteTokens || 0) + (usage.cacheWriteTokens || 0);
 
     const pricing = resolvePricing(model, at);
+    // 缓存 token 有自己的价：读 ≈ 0.1×，写 = 1.25×（5 分钟 TTL）。
+    // v0.7 之前这两项成本恒为 0，导致开启 prompt caching 后成本系统性偏低。
+    const cacheReadPrice = pricing.cacheRead ?? pricing.input * 0.1;
+    const cacheWritePrice = pricing.cacheWrite ?? pricing.input * 1.25;
     const costUsd =
       (usage.inputTokens * pricing.input) / 1_000_000 +
-      (usage.outputTokens * pricing.output) / 1_000_000;
+      (usage.outputTokens * pricing.output) / 1_000_000 +
+      ((usage.cacheReadTokens ?? 0) * cacheReadPrice) / 1_000_000 +
+      ((usage.cacheWriteTokens ?? 0) * cacheWritePrice) / 1_000_000;
 
     const record: CostRecord = {
       usage,
@@ -186,8 +200,28 @@ export class TokenTracker {
     return record;
   }
 
+  /** 计费口径：input + output（不含缓存）。保留原语义，向后兼容。 */
   getTotalTokens(): number {
     return this.totalUsage.inputTokens + this.totalUsage.outputTokens;
+  }
+
+  /**
+   * 真实 prompt 规模 = input + cache_creation + cache_read。
+   *
+   * API 的 `input_tokens` 语义是**未命中缓存的剩余部分** —— 只看它会严重低估
+   * 实际送进模型的上下文大小。跑在大缓存前缀上的会话，真实规模可能是它的数倍。
+   */
+  getPromptTokens(): number {
+    return (
+      this.totalUsage.inputTokens +
+      (this.totalUsage.cacheReadTokens || 0) +
+      (this.totalUsage.cacheWriteTokens || 0)
+    );
+  }
+
+  /** 预算口径：真实 prompt 规模 + 输出。预算熔断必须用这个而不是 getTotalTokens()。 */
+  getConsumedTokens(): number {
+    return this.getPromptTokens() + this.totalUsage.outputTokens;
   }
 
   getTotalCost(): number {
@@ -195,7 +229,7 @@ export class TokenTracker {
   }
 
   isOverBudget(maxTokens: number): boolean {
-    return this.getTotalTokens() > maxTokens;
+    return this.getConsumedTokens() > maxTokens;
   }
 
   getUsage(): TokenUsage {

@@ -252,6 +252,89 @@ describe('TokenTracker', () => {
     });
   });
 
+  // ============ v0.7：缓存 token 计价与预算口径 ============
+  describe('缓存 token 计价（v0.7 之前成本恒为 $0）', () => {
+    it('cache read 按 0.1× input 计价', () => {
+      // claude-opus-5: input $5 → cache read $0.5 / 1M
+      const r = tracker.add(
+        { inputTokens: 0, outputTokens: 0, cacheReadTokens: 1_000_000 },
+        'claude-opus-5'
+      );
+      expect(r.costUsd).toBeCloseTo(0.5);
+    });
+
+    it('cache write 按 1.25× input 计价（5 分钟 TTL）', () => {
+      // claude-opus-5: input $5 → cache write $6.25 / 1M
+      const r = tracker.add(
+        { inputTokens: 0, outputTokens: 0, cacheWriteTokens: 1_000_000 },
+        'claude-opus-5'
+      );
+      expect(r.costUsd).toBeCloseTo(6.25);
+    });
+
+    it('四种 token 的成本累加', () => {
+      const r = tracker.add(
+        {
+          inputTokens: 1_000_000,
+          outputTokens: 1_000_000,
+          cacheReadTokens: 1_000_000,
+          cacheWriteTokens: 1_000_000,
+        },
+        'claude-opus-5'
+      );
+      // 5 + 25 + 0.5 + 6.25
+      expect(r.costUsd).toBeCloseTo(36.75);
+    });
+
+    it('无缓存 token 时成本与 v0.6 一致（不改变既有账）', () => {
+      const r = tracker.add(
+        { inputTokens: 1_000_000, outputTokens: 1_000_000 },
+        'claude-opus-5'
+      );
+      expect(r.costUsd).toBeCloseTo(30);
+    });
+  });
+
+  describe('token 口径拆分（预算熔断必须含缓存）', () => {
+    const withCache = {
+      inputTokens: 100,
+      outputTokens: 50,
+      cacheReadTokens: 900,
+      cacheWriteTokens: 200,
+    };
+
+    it('getTotalTokens 保持原语义：input + output', () => {
+      tracker.add(withCache, 'claude-opus-5');
+      expect(tracker.getTotalTokens()).toBe(150);
+    });
+
+    it('getPromptTokens 是真实 prompt 规模：input + cache_read + cache_write', () => {
+      tracker.add(withCache, 'claude-opus-5');
+      // API 的 input_tokens 只是「未命中缓存的剩余部分」
+      expect(tracker.getPromptTokens()).toBe(100 + 900 + 200);
+    });
+
+    it('getConsumedTokens 是预算口径：prompt + output', () => {
+      tracker.add(withCache, 'claude-opus-5');
+      expect(tracker.getConsumedTokens()).toBe(1200 + 50);
+    });
+
+    it('🔴 预算熔断按含缓存的口径判定（v0.6 会漏判）', () => {
+      tracker.add(withCache, 'claude-opus-5');
+      // 旧口径 getTotalTokens()=150，看起来远未超；真实消耗 1250 已超
+      expect(tracker.getTotalTokens()).toBeLessThan(1000);
+      expect(tracker.isOverBudget(1000)).toBe(true);
+    });
+
+    it('无缓存 token 时熔断行为与 v0.6 完全一致', () => {
+      tracker.add({ inputTokens: 600, outputTokens: 500 }, 'claude-opus-5');
+      expect(tracker.isOverBudget(1000)).toBe(true);
+      tracker.reset();
+      tracker.add({ inputTokens: 500, outputTokens: 500 }, 'claude-opus-5');
+      expect(tracker.isOverBudget(1000)).toBe(false);
+    });
+  });
+
   describe('reset()', () => {
     it('clears all data', () => {
       tracker.add({ inputTokens: 5000, outputTokens: 3000 }, MODEL);
