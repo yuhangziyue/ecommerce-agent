@@ -13,6 +13,9 @@ import { SseWriter } from './sse.js';
 import { SummaryCompactor } from '../memory/summary-compactor.js';
 import { createCompactionMiddleware } from '../middleware/compaction.mw.js';
 import { createProfileMiddleware } from '../middleware/profile.mw.js';
+import { createIntentMiddleware } from '../middleware/intent.mw.js';
+import { IntentRecognizer } from '../intent/recognizer.js';
+import type { IntentState } from '../intent/types.js';
 import { Pipeline } from '../core/pipeline.js';
 import type { Stores } from '../store/index.js';
 import type { AgentConfig, AgentEvent, ChatProvider } from '../core/types.js';
@@ -67,22 +70,29 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   const registry = buildToolRegistry();
   setRefundStore(stores.refunds);
 
-  const compactor = new SummaryCompactor({
-    provider: opts.provider ?? new ModelProvider(config.model, config.apiKey),
-    model: config.model,
-  });
+  const sharedProvider = opts.provider ?? new ModelProvider(config.model, config.apiKey);
+  const compactor = new SummaryCompactor({ provider: sharedProvider, model: config.model });
+  const recognizer = new IntentRecognizer({ provider: sharedProvider });
 
   /** 在默认管道上挂两个记忆中间件（顺序约束由 buildDefaultPipeline 内部保证） */
   function buildMemoryPipeline(o: {
     tracker: TokenTracker;
     session: Session;
     userId: string | null;
+    onIntent?: (state: IntentState) => void;
   }): Pipeline {
     return buildDefaultPipeline({
       tracker: o.tracker,
       maxTokens: config.maxTokensPerSession,
       maxMessages: 20,
-      preTurn: [createProfileMiddleware({ profiles: stores.profiles, userId: o.userId })],
+      enrich: [
+        createProfileMiddleware({ profiles: stores.profiles, userId: o.userId }),
+        createIntentMiddleware({
+          recognizer,
+          session: o.session,
+          onRecognized: o.onIntent,
+        }),
+      ],
       beforeTrim: [createCompactionMiddleware({ compactor, session: o.session })],
     });
   }
@@ -92,7 +102,10 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
    * 代价是每次读一次库（v0.7 用 Redis 热缓存优化），
    * 收益是天然可水平扩容：任意实例都能接任意请求。
    */
-  async function prepareTurn(body: ChatBody): Promise<
+  async function prepareTurn(
+    body: ChatBody,
+    onIntent?: (state: IntentState) => void
+  ): Promise<
     | { ok: true; session: Session; loop: AgentLoop; bus: EventBus; tracker: TokenTracker }
     | { ok: false; status: number; code: string; message: string }
   > {
@@ -128,6 +141,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         tracker,
         session,
         userId: session.getUserId(),
+        onIntent,
       }),
       scorer: new ResponseScorer(),
       // 服务端没有交互式确认的通道：高风险工具一律拒绝，
@@ -144,7 +158,16 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     '/v1/chat',
     { schema: { body: CHAT_BODY_SCHEMA } },
     async (request, reply) => {
-      const prepared = await prepareTurn(request.body);
+      let writer: SseWriter | undefined;
+      const prepared = await prepareTurn(request.body, (state) =>
+        writer?.writeIntent({
+          intent: state.intent,
+          confidence: state.confidence,
+          phase: state.phase,
+          slots: state.slots as Record<string, unknown>,
+          missing: state.missing,
+        })
+      );
       if (!prepared.ok) {
         return reply
           .status(prepared.status)
@@ -160,7 +183,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         'X-Session-Id': session.getId(),
       });
 
-      const writer = new SseWriter(reply.raw);
+      writer = new SseWriter(reply.raw);
       // 客户端断开就停止写出（本版不中断 Loop —— 真正的中断归 v1.0 韧性版）
       request.raw.on('close', () => writer.markClosed());
 

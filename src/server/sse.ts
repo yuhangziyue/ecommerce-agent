@@ -57,6 +57,17 @@ export class SseWriter {
     this.safeWrite(frame('session', { session_id: sessionId }));
   }
 
+  /** 意图识别结果（v0.8）。调用方可据此做前端提示或埋点。 */
+  writeIntent(payload: {
+    intent: string;
+    confidence: number;
+    phase: string;
+    slots: Record<string, unknown>;
+    missing: string[];
+  }): void {
+    this.safeWrite(frame('intent', payload));
+  }
+
   writeEvent(event: AgentEvent): void {
     this.safeWrite(agentEventToSse(event));
   }

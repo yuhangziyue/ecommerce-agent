@@ -24,8 +24,14 @@ export interface DefaultPipelineOptions {
   onWarn?: (warning: string) => void;
   /** 预算预警比例，默认 0.8 */
   warningThreshold?: number;
-  /** 追加到管道最前的中间件（v0.7 的用户画像注入走这里） */
-  preTurn?: AgentMiddleware[];
+  /**
+   * 上下文增强中间件（画像注入、意图识别）。
+   *
+   * 位置在 `input-filter` **之后** —— 这是硬约束：
+   * 恶意输入必须先被拦住，一次模型调用都不该发生。v0.8 的意图识别是真实的
+   * 模型调用，放在过滤之前等于给攻击者免费烧钱。
+   */
+  enrich?: AgentMiddleware[];
   /**
    * 插在 `context-trim` **之前**的中间件（v0.7 的摘要压缩走这里）。
    *
@@ -55,8 +61,8 @@ export function buildDefaultPipeline(opts: DefaultPipelineOptions): Pipeline {
   } = opts;
 
   return new Pipeline([
-    ...(opts.preTurn ?? []),
     createInputFilterMiddleware(),
+    ...(opts.enrich ?? []),
     ...(opts.beforeTrim ?? []),
     createContextTrimMiddleware(new ContextManager(maxMessages)),
     createBudgetGuardMiddleware(

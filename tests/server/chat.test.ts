@@ -15,16 +15,31 @@ import type {
 const usage = { inputTokens: 10, outputTokens: 5 };
 
 class FakeProvider implements ChatProvider {
+  /** 主循环调用次数（不含意图识别 —— 那是旁路的辅助调用） */
   calls = 0;
+  /** 意图识别调用次数 */
+  intentCalls = 0;
   chunkCount = 4;
   script: ChatResponse[] = [];
+  /** 意图识别的返回；默认非 JSON → 降级 unknown，不影响不关心意图的用例 */
+  intentReply = '无法判断';
 
   async chat(
-    _s: string,
+    system: string,
     _m: never,
     _t: AgentTool[],
     opts?: { onDelta?(t: string): void }
   ): Promise<ChatResponse> {
+    // 意图识别与主循环共用同一个 provider（生产也是如此），靠 system prompt 区分
+    if (system.includes('意图识别模块')) {
+      this.intentCalls++;
+      return {
+        content: this.intentReply,
+        toolUses: [],
+        usage,
+        stopReason: 'end_turn',
+      };
+    }
     this.calls++;
     const response =
       this.script.shift() ??
@@ -86,7 +101,9 @@ describe('POST /v1/chat（SSE）', () => {
   beforeEach(async () => {
     await truncateAll(db);
     provider.calls = 0;
+    provider.intentCalls = 0;
     provider.script = [];
+    provider.intentReply = '无法判断';
   });
 
   it('返回 text/event-stream，且以 session 开头、done 结尾', async () => {
@@ -212,8 +229,28 @@ describe('POST /v1/chat（SSE）', () => {
     expect(blocked).toBeDefined();
     expect(blocked![1].by).toBe('input-filter');
     expect(provider.calls).toBe(0);
+    // 🔴 意图识别也不该发生 —— input-filter 必须排在增强类中间件之前，
+    // 否则恶意输入会先烧一次识别调用
+    expect(provider.intentCalls).toBe(0);
     // 终端事件仍然必发 —— 客户端靠 done 关流，不靠超时
     expect(events[events.length - 1][0]).toBe('done');
+  });
+
+  it('SSE 出现 intent 事件（v0.8）', async () => {
+    provider.intentReply =
+      '{"intent":"order_query","confidence":0.9,"slots":{"orderId":"ORD-1"}}';
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/chat',
+      payload: { message: '我的订单 ORD-1 到哪了' },
+    });
+
+    const events = parseSse(res.body);
+    const intent = events.find((e) => e[0] === 'intent');
+    expect(intent).toBeDefined();
+    expect(intent![1].intent).toBe('order_query');
+    expect(intent![1].slots.orderId).toBe('ORD-1');
   });
 
   it('缺 message → 400 且错误体是统一形状', async () => {
@@ -269,7 +306,9 @@ describe('POST /v1/chat/sync', () => {
   beforeEach(async () => {
     await truncateAll(db);
     provider.calls = 0;
+    provider.intentCalls = 0;
     provider.script = [];
+    provider.intentReply = '无法判断';
   });
 
   it('返回完整 JSON：reply / session_id / usage', async () => {
