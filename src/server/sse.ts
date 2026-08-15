@@ -36,6 +36,8 @@ export function agentEventToSse(event: AgentEvent): string {
       });
     case 'tool_rejected':
       return frame('tool_rejected', { tool: event.toolName, reason: event.reason });
+    case 'cancelled':
+      return frame('cancelled', { reason: event.reason });
     case 'artifact':
       return frame('artifact', {
         tool: event.toolName,

@@ -101,6 +101,11 @@ export interface AgentLoopDeps {
   onUsage?: (record: CostRecord) => void | Promise<void>;
   /** v0.15：跨进程链路号。HTTP 层从请求头取或新建，一路透传到工具服务 */
   traceId?: string;
+  /**
+   * v1.0：取消信号。缺省不传时行为与 v0.15 完全一致 ——
+   * 这是刻意的：取消能力不该改变没有取消时的语义。
+   */
+  signal?: AbortSignal;
 }
 
 export class AgentLoop {
@@ -116,6 +121,7 @@ export class AgentLoop {
   private readonly onUsage?: (record: CostRecord) => void | Promise<void>;
   /** v0.15：本轮链路号。由调用方给，缺省自生成 */
   private readonly traceId: string;
+  private readonly signal?: AbortSignal;
   private conversationMessages: Message[] = [];
 
   constructor(deps: AgentLoopDeps) {
@@ -133,6 +139,7 @@ export class AgentLoop {
     this.redactorFactory = deps.redactor;
     this.onUsage = deps.onUsage;
     this.traceId = deps.traceId ?? newTraceId();
+    this.signal = deps.signal;
 
     // v0.4：事件分发收敛到总线。`onEvent` 与 `trajectory` 从「Loop 的两套并行机制」
     // 降级为两个普通订阅者 —— 调用方签名不变，但 v0.6 的 SSE 写出器可以直接
@@ -180,6 +187,7 @@ export class AgentLoop {
 
     while (turns < this.config.maxTurns) {
       turns++;
+      if (this.signal?.aborted) return this.cancelTurn();
 
       // ── 钩子 2：beforeModel —— 上下文裁剪与预算/配额熔断 ──
       ctx.messages = this.conversationMessages;
@@ -218,6 +226,7 @@ export class AgentLoop {
           this.conversationMessages,
           visibleTools,
           {
+            signal: this.signal,
             onDelta: (text) => {
               if (!redactor) {
                 this.emit({ type: 'delta', text });
@@ -232,6 +241,10 @@ export class AgentLoop {
         flushRedactor();
       } catch (err: any) {
         flushRedactor();
+        // 取消不是错误 —— 客户端断开导致的中止不该进错误率
+        if (this.signal?.aborted || err?.name === 'AbortError') {
+          return this.cancelTurn();
+        }
         const errorMsg = `LLM调用失败: ${err.message}`;
         this.emit({ type: 'error', error: errorMsg });
         this.emitDone();
@@ -346,6 +359,7 @@ export class AgentLoop {
     }
 
     // 阶段 3：并发执行（Promise.all 按输入顺序返回，天然保序）
+    // 确认阶段可能等了很久（异步确认），期间客户端可能已经走了
     const results = await Promise.all(
       plans.map(async (plan): Promise<ToolResult> => {
         if (plan.error) {
@@ -377,6 +391,7 @@ export class AgentLoop {
             userId: this.session.getUserId(),
             tenantId: this.session.getTenantId(),
             traceId: this.traceId,
+            signal: this.signal,
           });
         } catch (err: any) {
           result = { content: `工具执行出错: ${err.message}`, isError: true };
@@ -452,6 +467,19 @@ export class AgentLoop {
   private async blockTurn(by: string, reason: string): Promise<string> {
     this.emit({ type: 'blocked', by, reason });
     await this.session.appendMetadata('blocked', { by, reason });
+    this.emitDone();
+    return reason;
+  }
+
+  /**
+   * 本轮被取消。
+   *
+   * 不发 `error` 事件、不记错误 —— 用户关掉页面是正常行为，
+   * 把它统计成系统错误会让错误率变成一堆噪声，真故障反而看不见了。
+   */
+  private cancelTurn(): string {
+    const reason = '客户端已断开，本轮已中止';
+    this.emit({ type: 'cancelled', reason });
     this.emitDone();
     return reason;
   }

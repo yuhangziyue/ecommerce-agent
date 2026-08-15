@@ -1,0 +1,64 @@
+# ⚠️ 未经实际运行验证（本机无 Docker）。拓扑与环境变量是准确的，
+# 但版本号/健康检查时序等细节请首次部署时自行核对。
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent
+      POSTGRES_DB: agent
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U agent']
+      interval: 5s
+      retries: 10
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      retries: 10
+
+  tool-service:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ['npx', 'tsx', 'src/tool-server.ts']
+    environment:
+      TOOL_SERVICE_PORT: 3101
+      DATABASE_URL: postgres://agent:agent@postgres:5432/agent
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    # 工具执行是无状态的，可以独立横向扩容 —— 这正是 v0.15 拆分的收益
+    deploy:
+      replicas: 2
+
+  agent-service:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      PORT: 3000
+      DATABASE_URL: postgres://agent:agent@postgres:5432/agent
+      REDIS_URL: redis://redis:6379
+      # 设了它就走远程工具执行；不设则单进程（两种模式行为一致，见 v0.15）
+      TOOL_SERVICE_URL: http://tool-service:3101
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?需要设置 ANTHROPIC_API_KEY}
+      AGENT_MODEL: claude-opus-5
+      SHUTDOWN_GRACE_MS: 15000
+    ports:
+      - '3000:3000'
+    depends_on:
+      postgres: { condition: service_healthy }
+      tool-service: { condition: service_started }
+    # 优雅退出需要足够的停机宽限 —— 小于 SHUTDOWN_GRACE_MS 会让在途请求被砍
+    stop_grace_period: 20s
+
+volumes:
+  pgdata:

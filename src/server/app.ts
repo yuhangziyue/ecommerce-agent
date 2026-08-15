@@ -211,6 +211,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   async function prepareTurn(
     body: ChatBody,
     traceId: string,
+    signal: AbortSignal | undefined,
     hooks: {
       onIntent?: (state: IntentState) => void;
       onRouted?: (agent: DomainAgent) => void;
@@ -271,6 +272,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       config,
       registry: toolGateway,
       traceId,
+      signal,
       session,
       bus,
       tracker,
@@ -377,7 +379,10 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     async (request, reply) => {
       let writer: SseWriter | undefined;
       const traceId = (request.headers['x-trace-id'] as string) || newTraceId();
-      const prepared = await prepareTurn(request.body, traceId, {
+      // v1.0：客户端断开 → 中断本轮。v0.6 只停止写出，模型继续跑完 ——
+      // 那不是浪费 CPU，是在给一个已经没人看的回答付钱
+      const controller = new AbortController();
+      const prepared = await prepareTurn(request.body, traceId, controller.signal, {
         onIntent: (state) =>
           writer?.writeIntent({
             intent: state.intent,
@@ -426,7 +431,10 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
 
       writer = new SseWriter(reply.raw);
       // 客户端断开就停止写出（本版不中断 Loop —— 真正的中断归 v1.0 韧性版）
-      request.raw.on('close', () => writer.markClosed());
+      request.raw.on('close', () => {
+        writer.markClosed();
+        controller.abort();
+      });
 
       writer.writeSession(session.getId());
       bus.subscribe((event: AgentEvent) => writer.writeEvent(event));
@@ -451,7 +459,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     { schema: { body: CHAT_BODY_SCHEMA } },
     async (request, reply) => {
       const traceId = (request.headers['x-trace-id'] as string) || newTraceId();
-      const prepared = await prepareTurn(request.body, traceId);
+      const prepared = await prepareTurn(request.body, traceId, undefined);
       if (!prepared.ok) {
         return reply
           .status(prepared.status)
@@ -838,13 +846,32 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
 
   // ============ 健康检查 ============
 
+  /**
+   * v1.0 优雅退出：收到信号后立刻置位。
+   *
+   * 健康检查马上转不健康，让负载均衡停止派新活 ——
+   * 而进程**继续服务在途请求**。这两件事必须分开：
+   * 「不接新活」和「立刻停机」差着所有在途请求的成败。
+   */
+  let draining = false;
+  app.decorate('startDraining', () => {
+    draining = true;
+  });
+
   app.get('/healthz', async (_request, reply) => {
+    if (draining) {
+      return reply.status(503).send({
+        status: 'draining',
+        message: '正在优雅退出，不再接受新流量；在途请求仍会完成',
+      });
+    }
     try {
       await stores.db.query('SELECT 1');
       return reply.send({
         status: 'ok',
         engine: stores.db.engine,
         cache: stores.cache.kind,
+        tool_gateway: opts.toolGateway ? 'remote' : 'local',
       });
     } catch (err) {
       return reply

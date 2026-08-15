@@ -172,13 +172,18 @@ export class ModelProvider implements ChatProvider {
     const anthropicMessages = messagesToAnthropicFormat(messages);
     const anthropicTools = tools.map(toolToAnthropicSchema);
 
-    const stream = this.client.messages.stream({
-      model: this.model,
-      max_tokens: 4096,
-      system: systemPrompt,
-      messages: anthropicMessages,
-      ...(anthropicTools.length > 0 ? { tools: anthropicTools } : {}),
-    });
+    const stream = this.client.messages.stream(
+      {
+        model: this.model,
+        max_tokens: 4096,
+        system: systemPrompt,
+        messages: anthropicMessages,
+        ...(anthropicTools.length > 0 ? { tools: anthropicTools } : {}),
+      },
+      // v1.0：把取消信号交给 SDK。客户端断开后继续生成，
+      // 是在给一个没人会看的回答付钱
+      opts?.signal ? { signal: opts.signal } : undefined
+    );
 
     if (opts?.onDelta) {
       // SDK 的 'text' 事件只吐文本增量，工具参数的 input_json_delta 不在其中

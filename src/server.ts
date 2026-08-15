@@ -3,6 +3,8 @@ import { openStores } from './store/index.js';
 import { SYSTEM_PROMPT } from './prompts/system-prompt.js';
 import type { AgentConfig } from './core/types.js';
 import { parseSafetyLag } from './server/config.js';
+import { installGracefulShutdown } from './server/shutdown.js';
+import { RemoteToolGateway, FetchTransport } from './tools/remote-gateway.js';
 
 /**
  * HTTP 服务入口（`npm run serve`）。
@@ -29,19 +31,29 @@ async function main(): Promise<void> {
 
   // stores 在进程启动时开一次，请求间共享 —— 不是每请求开库
   const stores = await openStores(process.env.DATABASE_URL, process.env.REDIS_URL);
-  const app = await buildApp({ stores, config, logger: true });
+
+  // v1.0：设了 TOOL_SERVICE_URL 就把工具执行交给独立的 tool-service，
+  // 不设则单进程运行（行为与 v0.14 完全一致）
+  const toolServiceUrl = process.env.TOOL_SERVICE_URL;
+  const app = await buildApp({
+    stores,
+    config,
+    logger: true,
+    toolGateway: toolServiceUrl
+      ? new RemoteToolGateway(
+          new FetchTransport(toolServiceUrl, Number(process.env.TOOL_TIMEOUT_MS ?? 10_000))
+        )
+      : undefined,
+  });
 
   const port = Number(process.env.PORT || 3000);
   const host = process.env.HOST || '0.0.0.0';
 
-  const shutdown = async (signal: string): Promise<void> => {
-    console.log(`\n收到 ${signal}，正在优雅退出…`);
-    await app.close();
-    await stores.close();
-    process.exit(0);
-  };
-  process.on('SIGINT', () => void shutdown('SIGINT'));
-  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  installGracefulShutdown({
+    app,
+    closeResources: () => stores.close(),
+    graceMs: Number(process.env.SHUTDOWN_GRACE_MS ?? 15_000),
+  });
 
   await app.listen({ port, host });
 
@@ -52,6 +64,9 @@ async function main(): Promise<void> {
   console.log(`  存储引擎: ${stores.db.engine}${process.env.DATABASE_URL ? '' : '（PGlite，设 DATABASE_URL 可切真实 PG）'}`);
   console.log(`  会话缓存: ${stores.cache.kind}${stores.cache.kind === 'noop' ? '（设 REDIS_URL 可启用；不可用时自动降级）' : ''}`);
   console.log(`  模型:     ${config.model}`);
+  console.log(
+    `  工具执行: ${toolServiceUrl ? `远程 ${toolServiceUrl}（熔断+重试已启用）` : '本进程（设 TOOL_SERVICE_URL 可拆分）'}`
+  );
   console.log('');
   console.log('  POST /v1/chat            → SSE 流式');
   console.log('  POST /v1/chat/sync       → JSON 一次性');

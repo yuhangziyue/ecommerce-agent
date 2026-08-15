@@ -63,7 +63,7 @@ export function collectFrom(
   metrics: AgentMetrics,
   turnStartedAt: number = Date.now()
 ): () => void {
-  let outcome: 'ok' | 'blocked' | 'error' = 'ok';
+  let outcome: 'ok' | 'blocked' | 'error' | 'cancelled' = 'ok';
 
   return bus.subscribe((event: AgentEvent) => {
     switch (event.type) {
@@ -84,6 +84,11 @@ export function collectFrom(
         break;
       case 'error':
         outcome = 'error';
+        break;
+      case 'cancelled':
+        // 用户关页面不是系统错误。混进 error 会让错误率变成噪声，
+        // 真故障反而被淹没
+        outcome = 'cancelled';
         break;
       case 'done': {
         metrics.turns.inc({ outcome });

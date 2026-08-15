@@ -139,7 +139,17 @@ export async function buildToolService(
       .send(metricsRegistry.render())
   );
 
+  let draining = false;
+  app.decorate('startDraining', () => {
+    draining = true;
+  });
+
   app.get('/healthz', async (_request, reply) => {
+    if (draining) {
+      return reply
+        .status(503)
+        .send({ status: 'draining', service: 'tool-service' });
+    }
     try {
       await opts.stores.db.query('SELECT 1');
       return reply.send({ status: 'ok', service: 'tool-service', tools: registry.getAll().length });

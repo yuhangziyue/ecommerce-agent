@@ -26,6 +26,8 @@ export interface ToolContext {
   tenantId?: string | null;
   /** v0.15：跨进程链路号。工具服务打日志时带上它，一次对话的动作才串得起来 */
   traceId?: string;
+  /** v1.0：取消信号。客户端断开后工具不该继续跑 */
+  signal?: AbortSignal;
 }
 
 // AgentTool - 工具定义（泛型，带TypeBox schema）
@@ -160,6 +162,11 @@ export type AgentEvent =
   | { type: 'error'; error: string }
   /** 被中间件拦截（注入检测 / 预算熔断 / 后续版本的合规与配额）；by 为中间件名 */
   | { type: 'blocked'; by: string; reason: string }
+  /**
+   * v1.0：本轮被取消（客户端断开）。
+   * **刻意不是 error** —— 把用户主动关页面记成系统错误，会让错误率指标变成噪声。
+   */
+  | { type: 'cancelled'; reason: string }
   | { type: 'done'; totalTokens: TokenUsage; totalCost: number };
 
 // ============ 模型调用抽象 ============
@@ -180,6 +187,11 @@ export interface ChatResponse {
  * 从而覆盖「循环终止 / 预算熔断 / 确认拒绝 / 工具报错回喂」这些不发真实请求就测不到的路径。
  */
 export interface ChatOptions {
+  /**
+   * v1.0：取消信号。客户端断开后模型调用要能被打断 ——
+   * 一个没人看的回答，继续生成就是在付钱买垃圾。
+   */
+  signal?: AbortSignal;
   /**
    * 给了就逐块回调模型输出的文本增量，不给就只等最终结果。
    * 调用方不必关心流式细节 —— `chat()` 的返回值始终是完整的 ChatResponse。

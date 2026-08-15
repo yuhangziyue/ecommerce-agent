@@ -1,5 +1,6 @@
 import { buildToolService } from './tool-service/app.js';
 import { openStores } from './store/index.js';
+import { installGracefulShutdown } from './server/shutdown.js';
 
 /**
  * 工具服务入口（`npm run serve:tools`）。
@@ -16,13 +17,11 @@ async function main(): Promise<void> {
   await app.listen({ port, host: '0.0.0.0' });
   console.log(`工具服务已启动: http://localhost:${port}`);
 
-  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-    process.on(signal, async () => {
-      await app.close();
-      await stores.close();
-      process.exit(0);
-    });
-  }
+  installGracefulShutdown({
+    app,
+    closeResources: () => stores.close(),
+    graceMs: Number(process.env.SHUTDOWN_GRACE_MS ?? 15_000),
+  });
 }
 
 main().catch((err) => {
