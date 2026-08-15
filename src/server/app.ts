@@ -13,6 +13,11 @@ import {
 } from '../billing/quota.js';
 import { ANONYMOUS_TENANT } from '../store/pg-usage-store.js';
 import { QUOTA_SCOPE_KEY } from '../middleware/quota.mw.js';
+import { FlowEngine } from '../flows/engine.js';
+import { buildReturnFlow, DEFAULT_RETURN_POLICY, RETURN_STATE_LABELS, type ReturnPolicy } from '../flows/return-flow.js';
+import { ConfirmationService, summarizeToolCall } from '../flows/confirmation.js';
+import { setFlowEngine } from '../tools/return-request.js';
+import type { ConfirmationRecord } from '../flows/types.js';
 import { SafetyScanner } from '../safety/scanner.js';
 import { DEFAULT_SAFETY_LAG } from '../safety/rules.js';
 import { buildToolRegistry } from '../tools/index.js';
@@ -44,6 +49,8 @@ export interface AppOptions {
    * 传 0 表示该级不限。
    */
   quotaLimits?: QuotaLimits;
+  /** v0.12 售后政策（时效与自动批准门槛）。业务参数，运营可调 */
+  returnPolicy?: ReturnPolicy;
 }
 
 const CHAT_BODY_SCHEMA = {
@@ -104,6 +111,14 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     quotaLimits
   );
 
+  // v0.12：流程引擎与确认服务都是进程级的，装配一次。
+  // 会话号不在这里绑定 —— 工具执行时从 ToolContext 拿，否则并发下会串会话。
+  const flows = new FlowEngine(stores.flows, [
+    buildReturnFlow(opts.returnPolicy ?? DEFAULT_RETURN_POLICY),
+  ]);
+  setFlowEngine(flows);
+  const confirmations = new ConfirmationService(stores.confirmations);
+
   /** 在默认管道上挂两个记忆中间件（顺序约束由 buildDefaultPipeline 内部保证） */
   function buildMemoryPipeline(o: {
     tracker: TokenTracker;
@@ -152,6 +167,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       onRouted?: (agent: DomainAgent) => void;
       onSafety?: (entry: SafetyAuditEntry) => void;
       onQuotaExceeded?: (scope: 'tenant' | 'session', reason: string) => void;
+      onConfirmationRequired?: (c: ConfirmationRecord) => void;
     } = {}
   ): Promise<
     | { ok: true; session: Session; loop: AgentLoop; bus: EventBus; tracker: TokenTracker }
@@ -251,9 +267,39 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
           config.safetyLag ?? DEFAULT_SAFETY_LAG
         ),
       scorer: new ResponseScorer(),
-      // 服务端没有交互式确认的通道：高风险工具一律拒绝，
-      // 由模型改走 human_handoff。真正的异步确认归 v0.12 业务流状态机。
-      onConfirm: async () => false,
+      // v0.12：高风险工具从「一律拒绝」改为「生成确认单」。
+      //
+      // v0.6 写死 `async () => false`，理由是服务端没有交互式确认通道 ——
+      // 但拒绝的话术被伪装成「用户取消了该操作」，而用户从没取消过任何东西。
+      // 模型据此推断事情办完了，回客户一句「已处理」。**退款在线上根本执行不了，
+      // 且日志里查不到任何异常。**
+      onConfirm: async (toolName, input) => {
+        const outcome = await confirmations.require({
+          sessionId: session!.getId(),
+          toolName,
+          toolInput: input,
+          summary: summarizeToolCall(toolName, input),
+        });
+
+        if (outcome.decision === 'approved') return { approved: true };
+
+        if (outcome.decision === 'rejected') {
+          return {
+            approved: false,
+            message: `客户已拒绝该操作（确认单 ${outcome.confirmation.id}）。请勿执行，并询问客户还需要什么帮助。`,
+          };
+        }
+
+        hooks.onConfirmationRequired?.(outcome.confirmation);
+        return {
+          approved: false,
+          // 这句话必须是真的：模型据此告诉客户去确认，而不是宣布已处理
+          message:
+            `该操作需要客户确认后才能执行，已生成确认单 ${outcome.confirmation.id}。\n` +
+            `确认内容：${outcome.confirmation.summary}\n` +
+            '请向客户复述上述内容并请其确认；确认后本操作会自动执行。',
+        };
+      },
     });
 
     return { ok: true, session, loop, bus, tracker };
@@ -289,6 +335,12 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
             rules: [...new Set(entry.matches.map((m) => m.ruleName))],
           }),
         onQuotaExceeded: (scope, reason) => writer?.writeQuota({ scope, reason }),
+        onConfirmationRequired: (c) =>
+          writer?.writeConfirmationRequired({
+            confirmation_id: c.id,
+            tool: c.toolName,
+            summary: c.summary,
+          }),
       });
       if (!prepared.ok) {
         return reply
@@ -414,6 +466,107 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       preferences: profile.preferences,
       notes: profile.notes,
       updated_at: profile.updatedAt,
+    });
+  });
+
+  // ============ 异步确认与业务流（v0.12） ============
+
+  const DECIDE_SCHEMA = {
+    type: 'object',
+    required: ['approved'],
+    properties: {
+      approved: { type: 'boolean' },
+      decided_by: { type: 'string' },
+    },
+    additionalProperties: false,
+  } as const;
+
+  app.post<{ Params: { id: string }; Body: { approved: boolean; decided_by?: string } }>(
+    '/v1/confirmations/:id',
+    { schema: { body: DECIDE_SCHEMA } },
+    async (request, reply) => {
+      const existing = await confirmations.get(request.params.id);
+      if (!existing) {
+        return reply
+          .status(404)
+          .send(errorBody('confirmation_not_found', `确认单 ${request.params.id} 不存在`));
+      }
+
+      const decided = await confirmations.decide(
+        request.params.id,
+        request.body.approved,
+        request.body.decided_by ?? 'customer'
+      );
+
+      // decide 返回 null = 已经被决策过。**409 而不是 200** ——
+      // 静默接受第二次决策会让「谁批的」变成一笔糊涂账
+      if (!decided) {
+        return reply
+          .status(409)
+          .send(
+            errorBody(
+              'confirmation_already_decided',
+              `确认单 ${request.params.id} 已处理过（当前状态 ${existing.status}），不能重复决策`
+            )
+          );
+      }
+
+      return reply.send({
+        confirmation_id: decided.id,
+        status: decided.status,
+        decided_by: decided.decidedBy,
+        summary: decided.summary,
+        // 明确告诉调用方还要再发一轮，操作才会真正执行
+        next: decided.status === 'approved'
+          ? '请再发一轮对话（如「已确认」），操作将自动执行'
+          : null,
+      });
+    }
+  );
+
+  app.get<{ Params: { id: string } }>(
+    '/v1/sessions/:id/confirmations',
+    async (request, reply) => {
+      const list = await confirmations.listBySession(request.params.id, 50);
+      return reply.send({
+        session_id: request.params.id,
+        confirmations: list.map((c) => ({
+          confirmation_id: c.id,
+          tool: c.toolName,
+          summary: c.summary,
+          status: c.status,
+          decided_by: c.decidedBy ?? null,
+          created_at: c.createdAt,
+        })),
+      });
+    }
+  );
+
+  app.get<{ Params: { id: string } }>('/v1/flows/:id', async (request, reply) => {
+    const flow = await flows.get(request.params.id);
+    if (!flow) {
+      return reply
+        .status(404)
+        .send(errorBody('flow_not_found', `流程 ${request.params.id} 不存在`));
+    }
+
+    const history = await flows.history(flow.id);
+    return reply.send({
+      flow_id: flow.id,
+      kind: flow.kind,
+      order_id: flow.subjectId,
+      state: flow.state,
+      state_label: RETURN_STATE_LABELS[flow.state] ?? flow.state,
+      available_events: flows.availableEvents(flow),
+      data: flow.data,
+      transitions: history.map((t) => ({
+        from: t.from,
+        to: t.to,
+        event: t.event,
+        actor: t.actor,
+        note: t.note ?? null,
+        at: t.at,
+      })),
     });
   });
 

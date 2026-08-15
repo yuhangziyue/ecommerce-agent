@@ -28,6 +28,8 @@ export async function makeTestStores(db: Database): Promise<Stores> {
   const { PgRefundStore } = await import('../../src/store/pg-refund-store.js');
   const { PgProfileStore } = await import('../../src/store/pg-profile-store.js');
   const { PgUsageStore } = await import('../../src/store/pg-usage-store.js');
+  const { PgFlowStore } = await import('../../src/store/pg-flow-store.js');
+  const { PgConfirmationStore } = await import('../../src/store/pg-confirmation-store.js');
   const { NoOpSessionCache } = await import('../../src/store/session-cache.js');
 
   const cache = new NoOpSessionCache();
@@ -37,6 +39,8 @@ export async function makeTestStores(db: Database): Promise<Stores> {
     refunds: new PgRefundStore(db),
     profiles: new PgProfileStore(db),
     usage: new PgUsageStore(db),
+    flows: new PgFlowStore(db),
+    confirmations: new PgConfirmationStore(db),
     cache,
     close: async () => {},
   };

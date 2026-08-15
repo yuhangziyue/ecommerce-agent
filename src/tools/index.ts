@@ -5,6 +5,8 @@ import { productSearchTool } from './product-search.js';
 import { faqSearchTool } from './faq-search.js';
 import { refundApplyTool } from './refund-apply.js';
 import { humanHandoffTool } from './human-handoff.js';
+import { returnRequestTool, flowStatusTool } from './return-request.js';
+import { logisticsCheckTool } from './logistics-check.js';
 
 export { ToolRegistry } from './tool-registry.js';
 export { orderLookupTool } from './order-lookup.js';
@@ -12,6 +14,8 @@ export { productSearchTool } from './product-search.js';
 export { faqSearchTool } from './faq-search.js';
 export { refundApplyTool } from './refund-apply.js';
 export { humanHandoffTool } from './human-handoff.js';
+export { returnRequestTool, flowStatusTool, setFlowEngine } from './return-request.js';
+export { logisticsCheckTool, judgeLogistics } from './logistics-check.js';
 
 /**
  * 全部工具的单一注册入口。
@@ -26,6 +30,10 @@ export const ALL_TOOLS: AgentTool[] = [
   faqSearchTool as AgentTool,
   refundApplyTool as AgentTool,
   humanHandoffTool as AgentTool,
+  // v0.12 电商场景 I
+  returnRequestTool as AgentTool,
+  flowStatusTool as AgentTool,
+  logisticsCheckTool as AgentTool,
 ];
 
 export function buildToolRegistry(tools: AgentTool[] = ALL_TOOLS): ToolRegistry {

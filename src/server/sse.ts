@@ -97,6 +97,20 @@ export class SseWriter {
     this.safeWrite(frame('quota', payload));
   }
 
+  /**
+   * 需要客户确认（v0.12）。
+   *
+   * 客户端拿到后应展示 `summary` 并给出「同意/拒绝」，
+   * 再调 `POST /v1/confirmations/:id` —— 确认是一次独立往返，不阻塞本次响应。
+   */
+  writeConfirmationRequired(payload: {
+    confirmation_id: string;
+    tool: string;
+    summary: string;
+  }): void {
+    this.safeWrite(frame('confirmation_required', payload));
+  }
+
   writeEvent(event: AgentEvent): void {
     this.safeWrite(agentEventToSse(event));
   }

@@ -117,6 +117,71 @@ CREATE INDEX IF NOT EXISTS idx_usage_session    ON usage_records (session_id, se
 CREATE INDEX IF NOT EXISTS idx_usage_tenant_ts  ON usage_records (tenant_id, created_at DESC);
 `,
   },
+  {
+    // v0.12 多步业务流。
+    //
+    // 为什么流程状态必须落库而不是留在模型上下文里：v0.7 的滑窗与摘要压缩
+    // 会裁剪历史，流程状态跟着一起没了 —— 而且断得悄无声息，
+    // 表现为「模型突然忘了正在处理退货」，排查时根本想不到是被裁掉的。
+    name: '005_business_flows',
+    sql: `
+CREATE TABLE IF NOT EXISTS business_flows (
+  id           TEXT PRIMARY KEY,
+  seq          BIGSERIAL,
+  kind         TEXT NOT NULL,
+  session_id   TEXT NOT NULL,
+  -- 业务主键（订单号）。一个订单同时只应有一条活跃流程 —— 靠部分唯一索引保证
+  subject_id   TEXT NOT NULL,
+  state        TEXT NOT NULL,
+  data         JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 每一次流转都留痕：出了纠纷要能回放「谁、何时、从哪到哪、凭什么」
+CREATE TABLE IF NOT EXISTS flow_transitions (
+  seq         BIGSERIAL PRIMARY KEY,
+  flow_id     TEXT NOT NULL REFERENCES business_flows(id) ON DELETE CASCADE,
+  from_state  TEXT NOT NULL,
+  to_state    TEXT NOT NULL,
+  event       TEXT NOT NULL,
+  actor       TEXT NOT NULL,
+  note        TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_flows_session ON business_flows (session_id, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_flows_subject ON business_flows (subject_id, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_transitions_flow ON flow_transitions (flow_id, seq);
+`,
+  },
+  {
+    // v0.12 异步确认。
+    //
+    // v0.6 给服务端写死 `onConfirm: () => false`，高风险工具一律拒绝，
+    // 且把拒绝理由伪装成「用户取消了该操作」—— 用户从没取消过任何东西，
+    // 排查的人会去查用户行为，而那里什么都没有。这张表让确认变成一次真实往返。
+    name: '006_confirmations',
+    sql: `
+CREATE TABLE IF NOT EXISTS confirmations (
+  id          TEXT PRIMARY KEY,
+  seq         BIGSERIAL,
+  session_id  TEXT NOT NULL,
+  tool_name   TEXT NOT NULL,
+  tool_input  JSONB NOT NULL DEFAULT '{}'::jsonb,
+  summary     TEXT NOT NULL,
+  -- pending / approved / rejected / consumed
+  -- consumed 是终态：确认单一次性消费，否则一张批准过的单能被重放成多次退款
+  status      TEXT NOT NULL DEFAULT 'pending',
+  decided_by  TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  decided_at  TIMESTAMPTZ,
+  consumed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_confirmations_session ON confirmations (session_id, seq DESC);
+`,
+  },
 ];
 
 /**

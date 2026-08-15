@@ -31,10 +31,27 @@ interface ToolPlan {
 }
 
 export type EventHandler = (event: AgentEvent) => void;
+/**
+ * 确认结果。
+ *
+ * v0.12 从 `boolean` 扩成可带原因的对象 —— 因为**拒绝的理由会被模型转述给客户**，
+ * 而 v0.6 的服务端把「没有确认通道」这个技术原因伪装成了「用户取消了该操作」。
+ * 模型据此推断事情办完了，回客户一句「已处理」，客户以为退款提交了，实际什么都没发生。
+ *
+ * 返回 boolean 仍然合法（CLI 路径不用改）。
+ */
+export interface ConfirmDecision {
+  approved: boolean;
+  /** 未批准时喂给模型的说明。必须说真话 —— 模型会照着它决定下一步 */
+  message?: string;
+  /** 未批准是否算错误。「等待客户确认」不是错误，「客户拒绝」也不是 */
+  isError?: boolean;
+}
+
 export type ConfirmHandler = (
   toolName: string,
   input: Record<string, unknown>
-) => Promise<boolean>;
+) => Promise<boolean | ConfirmDecision>;
 
 /**
  * AgentLoop 的依赖。
@@ -301,9 +318,15 @@ export class AgentLoop {
     for (const plan of plans) {
       if (plan.error || !plan.tool) continue;
       if (plan.tool.riskLevel === 'high' && this.config.confirmHighRisk) {
-        const confirmed = await this.onConfirm(plan.toolUse.name, plan.toolUse.input);
-        if (!confirmed) {
-          plan.error = { content: '用户取消了该操作。', isError: false };
+        const decision = await this.onConfirm(plan.toolUse.name, plan.toolUse.input);
+        const normalized: ConfirmDecision =
+          typeof decision === 'boolean' ? { approved: decision } : decision;
+
+        if (!normalized.approved) {
+          plan.error = {
+            content: normalized.message ?? '用户取消了该操作。',
+            isError: normalized.isError ?? false,
+          };
         }
       }
     }
@@ -328,7 +351,11 @@ export class AgentLoop {
         const startTime = Date.now();
         let result: ToolResult;
         try {
-          result = await tool.execute(plan.toolUse.input);
+          result = await tool.execute(plan.toolUse.input, {
+            sessionId: this.session.getId(),
+            userId: this.session.getUserId(),
+            tenantId: this.session.getTenantId(),
+          });
         } catch (err: any) {
           result = { content: `工具执行出错: ${err.message}`, isError: true };
         }

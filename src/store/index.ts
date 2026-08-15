@@ -4,6 +4,8 @@ import { PgSessionStore } from './pg-session-store.js';
 import { PgRefundStore } from './pg-refund-store.js';
 import { PgProfileStore } from './pg-profile-store.js';
 import { PgUsageStore } from './pg-usage-store.js';
+import { PgFlowStore } from './pg-flow-store.js';
+import { PgConfirmationStore } from './pg-confirmation-store.js';
 import { createSessionCache, CachedSessionStore, type SessionCache } from './session-cache.js';
 import type {
   Database,
@@ -12,6 +14,7 @@ import type {
   SessionStore,
   UsageStore,
 } from './types.js';
+import type { ConfirmationStore, FlowStore } from '../flows/types.js';
 
 export * from './types.js';
 export { createDatabase, PGliteDatabase, PgPoolDatabase } from './database.js';
@@ -20,6 +23,8 @@ export { PgSessionStore } from './pg-session-store.js';
 export { PgRefundStore } from './pg-refund-store.js';
 export { PgProfileStore, renderProfileContext } from './pg-profile-store.js';
 export { PgUsageStore, ANONYMOUS_TENANT } from './pg-usage-store.js';
+export { PgFlowStore } from './pg-flow-store.js';
+export { PgConfirmationStore } from './pg-confirmation-store.js';
 export {
   createSessionCache,
   CachedSessionStore,
@@ -35,6 +40,9 @@ export interface Stores {
   profiles: ProfileStore;
   /** v0.11 计费账本 */
   usage: UsageStore;
+  /** v0.12 业务流与异步确认 */
+  flows: FlowStore;
+  confirmations: ConfirmationStore;
   /** v0.7：会话热缓存。Redis 不可用时是 NoOp —— 服务照常工作，只是慢一点 */
   cache: SessionCache;
   close(): Promise<void>;
@@ -62,6 +70,8 @@ export async function openStores(
     refunds: new PgRefundStore(db),
     profiles: new PgProfileStore(db),
     usage: new PgUsageStore(db),
+    flows: new PgFlowStore(db),
+    confirmations: new PgConfirmationStore(db),
     cache,
     close: async () => {
       await cache.close();

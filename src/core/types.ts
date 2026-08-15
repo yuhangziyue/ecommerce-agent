@@ -5,13 +5,26 @@ export interface ToolResult {
   metadata?: Record<string, unknown>;
 }
 
+/**
+ * 工具执行上下文（v0.12）。
+ *
+ * 为什么不用模块级变量存 sessionId：服务端并发处理多个请求，
+ * 模块级的「当前会话」会被后来的请求覆盖 —— 表现为**甲客户的退货记到乙客户名下**，
+ * 且只在有并发时出现，本地单请求测试永远发现不了。
+ */
+export interface ToolContext {
+  sessionId: string;
+  userId?: string | null;
+  tenantId?: string | null;
+}
+
 // AgentTool - 工具定义（泛型，带TypeBox schema）
 export interface AgentTool<T = any> {
   name: string;
   description: string;
   parameters: T; // TypeBox schema
   riskLevel: 'low' | 'medium' | 'high';
-  execute: (params: any) => Promise<ToolResult>;
+  execute: (params: any, ctx?: ToolContext) => Promise<ToolResult>;
 }
 
 // Message types
