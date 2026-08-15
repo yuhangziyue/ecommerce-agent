@@ -6,6 +6,13 @@ import { Session } from '../core/session.js';
 import { TokenTracker } from '../core/token-tracker.js';
 import { buildDefaultPipeline, type SafetyAuditEntry } from '../middleware/index.js';
 import { StreamingRedactor } from '../safety/streaming-redactor.js';
+import {
+  QuotaService,
+  createQuotaCounter,
+  type QuotaLimits,
+} from '../billing/quota.js';
+import { ANONYMOUS_TENANT } from '../store/pg-usage-store.js';
+import { QUOTA_SCOPE_KEY } from '../middleware/quota.mw.js';
 import { SafetyScanner } from '../safety/scanner.js';
 import { DEFAULT_SAFETY_LAG } from '../safety/rules.js';
 import { buildToolRegistry } from '../tools/index.js';
@@ -32,6 +39,11 @@ export interface AppOptions {
   /** 注入假 provider 便于测试；缺省用真实 ModelProvider */
   provider?: ChatProvider;
   logger?: boolean;
+  /**
+   * v0.11 配额上限。缺省用 `config.maxTokensPerSession` 作会话上限、租户不限。
+   * 传 0 表示该级不限。
+   */
+  quotaLimits?: QuotaLimits;
 }
 
 const CHAT_BODY_SCHEMA = {
@@ -81,20 +93,39 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   const recognizer = new IntentRecognizer({ provider: sharedProvider });
   const agents = new AgentRegistry();
 
+  // v0.11：配额服务是进程级的，装配一次。
+  // 计数器优先用 Redis（原子且快），连不上就直接查账本 —— 慢，但不停摆。
+  const quotaLimits: QuotaLimits = opts.quotaLimits ?? {
+    perSession: config.maxTokensPerSession,
+    perTenant: 0, // 缺省不限租户；生产按合同配置
+  };
+  const quota = new QuotaService(
+    await createQuotaCounter(stores.usage, process.env.REDIS_URL),
+    quotaLimits
+  );
+
   /** 在默认管道上挂两个记忆中间件（顺序约束由 buildDefaultPipeline 内部保证） */
   function buildMemoryPipeline(o: {
     tracker: TokenTracker;
     session: Session;
     userId: string | null;
+    tenantId: string | null;
     onIntent?: (state: IntentState) => void;
     onRouted?: (agent: DomainAgent) => void;
     onSafety?: (entry: SafetyAuditEntry) => void;
+    onQuotaExceeded?: (scope: 'tenant' | 'session', reason: string) => void;
   }): Pipeline {
     return buildDefaultPipeline({
       tracker: o.tracker,
       maxTokens: config.maxTokensPerSession,
       maxMessages: 20,
       safety: { session: o.session, onVerdict: o.onSafety },
+      // v0.11：配额读账本而非进程内计数器 —— 这才让 maxTokensPerSession 名副其实
+      quota: {
+        service: quota,
+        tenantId: o.tenantId,
+        onExceeded: o.onQuotaExceeded,
+      },
       enrich: [
         createProfileMiddleware({ profiles: stores.profiles, userId: o.userId }),
         createIntentMiddleware({
@@ -120,6 +151,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       onIntent?: (state: IntentState) => void;
       onRouted?: (agent: DomainAgent) => void;
       onSafety?: (entry: SafetyAuditEntry) => void;
+      onQuotaExceeded?: (scope: 'tenant' | 'session', reason: string) => void;
     } = {}
   ): Promise<
     | { ok: true; session: Session; loop: AgentLoop; bus: EventBus; tracker: TokenTracker }
@@ -144,8 +176,26 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       });
     }
 
+    // ── 配额预检 ──
+    // 必须在这里做，而不是只靠管道里的 quota 中间件：SSE 一旦写出响应头就是 200，
+    // 之后再发现租户欠费也没法改成 429 了。管道里那道检查负责工具循环中途越限，
+    // 两道不是重复 —— 它们拦的是不同时刻。
+    const preflight = await quota.check({
+      tenantId: session.getTenantId(),
+      sessionId: session.getId(),
+    });
+    if (!preflight.allowed && preflight.scope === 'tenant') {
+      return {
+        ok: false,
+        status: 429,
+        code: 'quota_exceeded',
+        message: preflight.reason,
+      };
+    }
+
     const bus = new EventBus();
     const tracker = new TokenTracker();
+    const tenantId = session.getTenantId() || ANONYMOUS_TENANT;
     const loop = new AgentLoop({
       config,
       registry,
@@ -157,10 +207,42 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         tracker,
         session,
         userId: session.getUserId(),
+        tenantId: session.getTenantId(),
         onIntent: hooks.onIntent,
         onRouted: hooks.onRouted,
         onSafety: hooks.onSafety,
+        onQuotaExceeded: hooks.onQuotaExceeded,
       }),
+      // v0.11：每次模型调用落一条账，并同步配额计数器。
+      // 落账失败只警告不中断（AgentLoop 内部已 try/catch）—— 但配额检查失败必须拦，
+      // 两者不对称是刻意的：记不上账是可以补的，放行超额是收不回来的。
+      onUsage: async (record) => {
+        const billable =
+          record.usage.inputTokens +
+          record.usage.outputTokens +
+          (record.usage.cacheReadTokens ?? 0) +
+          (record.usage.cacheWriteTokens ?? 0);
+
+        await stores.usage.append({
+          tenantId,
+          sessionId: session!.getId(),
+          model: record.model,
+          inputTokens: record.usage.inputTokens,
+          outputTokens: record.usage.outputTokens,
+          cacheReadTokens: record.usage.cacheReadTokens ?? 0,
+          cacheWriteTokens: record.usage.cacheWriteTokens ?? 0,
+          billableTokens: billable,
+          costUsd: record.costUsd,
+          pricingResolved: record.pricingResolved,
+          at: record.timestamp,
+        });
+
+        await quota.record({
+          tenantId: session!.getTenantId(),
+          sessionId: session!.getId(),
+          billableTokens: billable,
+        });
+      },
       // v0.10：delta 必须过脱敏器再出门。少了这一行，afterTurn 的脱敏只保护
       // 非流式返回值，未脱敏的手机号已经先一步打到用户屏幕上了（v0.4 的洞）。
       redactor: () =>
@@ -206,6 +288,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
             // 只发规则名，不发命中原文
             rules: [...new Set(entry.matches.map((m) => m.ruleName))],
           }),
+        onQuotaExceeded: (scope, reason) => writer?.writeQuota({ scope, reason }),
       });
       if (!prepared.ok) {
         return reply
@@ -333,6 +416,54 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       updated_at: profile.updatedAt,
     });
   });
+
+  // ============ 用量查询（v0.11） ============
+
+  app.get<{ Params: { id: string }; Querystring: { since?: string; limit?: string } }>(
+    '/v1/tenants/:id/usage',
+    async (request, reply) => {
+      const since = request.query.since ? Number(request.query.since) : undefined;
+      if (since !== undefined && !Number.isFinite(since)) {
+        return reply
+          .status(400)
+          .send(errorBody('invalid_since', 'since 必须是毫秒时间戳'));
+      }
+
+      const limit = Math.min(Number(request.query.limit) || 50, 200);
+      const [summary, records] = await Promise.all([
+        stores.usage.sumByTenant(request.params.id, since),
+        stores.usage.listByTenant(request.params.id, limit),
+      ]);
+
+      // 租户不存在与租户零用量**返回同一个结果**（全零）：
+      // 用 404 区分等于给出一个租户是否存在的探测接口
+      return reply.send({
+        tenant_id: request.params.id,
+        since: since ?? null,
+        limits: {
+          per_session: quotaLimits.perSession,
+          per_tenant: quotaLimits.perTenant,
+        },
+        summary: {
+          billable_tokens: summary.billableTokens,
+          input_tokens: summary.inputTokens,
+          output_tokens: summary.outputTokens,
+          cache_read_tokens: summary.cacheReadTokens,
+          cache_write_tokens: summary.cacheWriteTokens,
+          cost_usd: Number(summary.costUsd.toFixed(10)),
+          call_count: summary.callCount,
+        },
+        records: records.map((r) => ({
+          session_id: r.sessionId,
+          model: r.model,
+          billable_tokens: r.billableTokens,
+          cost_usd: Number(r.costUsd.toFixed(10)),
+          pricing_resolved: r.pricingResolved ?? null,
+          at: r.at,
+        })),
+      });
+    }
+  );
 
   // ============ 领域 Agent 列表（v0.9） ============
 

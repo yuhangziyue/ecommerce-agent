@@ -12,6 +12,7 @@ import type {
   AgentEvent,
   AgentTool,
   ChatProvider,
+  CostRecord,
   Message,
   ToolResult,
   ToolUse,
@@ -62,6 +63,15 @@ export interface AgentLoopDeps {
    * 跨调用复用会把上一次的尾巴混进这一次。缺省表示 delta 直放（v0.4 行为）。
    */
   redactor?: () => StreamingRedactor;
+  /**
+   * v0.11：每次模型调用后回调，用于落计费账本。
+   *
+   * 放在 Loop 而不是中间件里，因为中间件看不到单次模型调用 —— 一轮里可能有
+   * 多次调用（工具循环），按轮记账会漏掉除最后一次以外的全部用量。
+   *
+   * **异步不阻塞**：落账失败只警告不中断对话（与审计写入同一原则）。
+   */
+  onUsage?: (record: CostRecord) => void | Promise<void>;
 }
 
 export class AgentLoop {
@@ -75,6 +85,7 @@ export class AgentLoop {
   private readonly onConfirm: ConfirmHandler;
   private readonly scorer?: ResponseScorer;
   private readonly redactorFactory?: () => StreamingRedactor;
+  private readonly onUsage?: (record: CostRecord) => void | Promise<void>;
   private conversationMessages: Message[] = [];
 
   constructor(deps: AgentLoopDeps) {
@@ -88,6 +99,7 @@ export class AgentLoop {
     this.onConfirm = deps.onConfirm ?? (async () => true);
     this.scorer = deps.scorer;
     this.redactorFactory = deps.redactor;
+    this.onUsage = deps.onUsage;
 
     // v0.4：事件分发收敛到总线。`onEvent` 与 `trajectory` 从「Loop 的两套并行机制」
     // 降级为两个普通订阅者 —— 调用方签名不变，但 v0.6 的 SSE 写出器可以直接
@@ -192,7 +204,13 @@ export class AgentLoop {
         return errorMsg;
       }
 
-      this.tracker.add(response.usage, this.config.model);
+      const costRecord = this.tracker.add(response.usage, this.config.model);
+      // 落账失败不该拖垮对话 —— 但也不能静默，否则账目对不上时无从查起
+      try {
+        await this.onUsage?.(costRecord);
+      } catch (err) {
+        console.warn(`[billing] 落账失败：${(err as Error).message}`);
+      }
 
       // ── 情况 A：纯文本回复，本轮收口 ──
       if (response.content && response.toolUses.length === 0) {

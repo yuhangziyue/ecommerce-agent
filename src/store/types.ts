@@ -101,3 +101,45 @@ export interface ProfileStore {
   ): Promise<UserProfile>;
   addNote(userId: string, note: string): Promise<UserProfile>;
 }
+
+// ============ 计费账本（v0.11） ============
+
+export interface UsageRecord {
+  tenantId: string;
+  sessionId: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  /**
+   * 计费口径的 token 数 = 真实 prompt 规模 + 输出。
+   *
+   * 用这个而不是 input+output：API 的 `input_tokens` 语义是**未命中缓存的剩余部分**，
+   * 只看它会让跑在大缓存前缀上的会话严重低估用量（v0.7 已在 TokenTracker 里踩过）。
+   */
+  billableTokens: number;
+  /** 按**调用当时**的价格算好的成本，不在查询时重算 */
+  costUsd: number;
+  /** 定价窗口来源标记，排查「这条为什么算这么多钱」 */
+  pricingResolved?: string;
+  at: number;
+}
+
+export interface UsageSummary {
+  billableTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costUsd: number;
+  callCount: number;
+}
+
+export interface UsageStore {
+  append(record: UsageRecord): Promise<void>;
+  /** `since` 为毫秒时间戳，用于按计费周期聚合 */
+  sumByTenant(tenantId: string, since?: number): Promise<UsageSummary>;
+  sumBySession(sessionId: string): Promise<UsageSummary>;
+  listByTenant(tenantId: string, limit?: number): Promise<UsageRecord[]>;
+}

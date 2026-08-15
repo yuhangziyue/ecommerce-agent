@@ -82,6 +82,41 @@ CREATE TABLE IF NOT EXISTS user_profiles (
 );
 `,
   },
+  {
+    // v0.11 计费账本。
+    //
+    // 为什么成本要**落库存下来**而不是查询时按当前价格重算：价格会变
+    // （v0.3 的 PriceWindow 就是为此存在的），而历史账单不该跟着变。
+    // 财务数据的第一原则是可复现 —— 上个月的账今天再查必须是同一个数。
+    name: '004_usage_records',
+    sql: `
+CREATE TABLE IF NOT EXISTS usage_records (
+  seq                BIGSERIAL PRIMARY KEY,
+  tenant_id          TEXT NOT NULL,
+  session_id         TEXT NOT NULL,
+  model              TEXT NOT NULL,
+  input_tokens       INTEGER NOT NULL DEFAULT 0,
+  output_tokens      INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+  cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+  -- 计费口径的 token 数（prompt 真实规模 + 输出），配额比对用这一列。
+  -- 冗余存储是刻意的：配额检查是热路径，不该每次做四列加法
+  billable_tokens    INTEGER NOT NULL DEFAULT 0,
+  -- NUMERIC 而非 DOUBLE：钱不能用浮点。20 位整数 + 10 位小数够到 1e10 美元
+  cost_usd           NUMERIC(20, 10) NOT NULL DEFAULT 0,
+  -- 定价来源标记（v0.3 的 PriceWindow.resolved），排查「这条为什么算这么多」
+  pricing_resolved   TEXT,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 配额检查的主查询：某租户累计用了多少
+CREATE INDEX IF NOT EXISTS idx_usage_tenant     ON usage_records (tenant_id, seq DESC);
+-- 会话级配额
+CREATE INDEX IF NOT EXISTS idx_usage_session    ON usage_records (session_id, seq DESC);
+-- 按时间窗查账（计费周期）
+CREATE INDEX IF NOT EXISTS idx_usage_tenant_ts  ON usage_records (tenant_id, created_at DESC);
+`,
+  },
 ];
 
 /**
@@ -114,9 +149,21 @@ export async function runMigrations(db: Database): Promise<string[]> {
   return executed;
 }
 
-/** 清空全部业务表（测试隔离用；不动 schema_migrations，避免每个用例重跑迁移） */
+/**
+ * 清空全部业务表（测试隔离用；不动 schema_migrations，避免每个用例重跑迁移）。
+ *
+ * 表名**从系统目录查**而不是写死。写死的版本在 v0.11 咬了一口：
+ * 新加 `usage_records` 忘了加进列表 → 数据在用例之间串，8 个用例莫名转红，
+ * 而报错信息（「期望 500 得到 3500」）完全指向错误的方向。
+ * 这类清单只要靠人记就一定会漏。
+ */
 export async function truncateAll(db: Database): Promise<void> {
-  await db.exec(
-    'TRUNCATE session_entries, sessions, refund_tickets, user_profiles RESTART IDENTITY CASCADE;'
+  const { rows } = await db.query<{ tablename: string }>(
+    `SELECT tablename FROM pg_tables
+      WHERE schemaname = 'public' AND tablename <> 'schema_migrations'`
   );
+  if (rows.length === 0) return;
+
+  const tables = rows.map((r) => `"${r.tablename}"`).join(', ');
+  await db.exec(`TRUNCATE ${tables} RESTART IDENTITY CASCADE;`);
 }

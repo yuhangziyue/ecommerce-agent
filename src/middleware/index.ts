@@ -5,7 +5,9 @@ import type { TokenTracker } from '../core/token-tracker.js';
 import { createContextTrimMiddleware } from './context-trim.mw.js';
 import { createBudgetGuardMiddleware } from './budget-guard.mw.js';
 import { createSafetyMiddleware, type SafetyAuditEntry } from './safety.mw.js';
+import { createQuotaMiddleware } from './quota.mw.js';
 import type { Session } from '../core/session.js';
+import type { QuotaService } from '../billing/quota.js';
 
 export { createInputFilterMiddleware } from './input-filter.mw.js';
 export { createOutputFilterMiddleware } from './output-filter.mw.js';
@@ -13,6 +15,7 @@ export { createBudgetGuardMiddleware } from './budget-guard.mw.js';
 export { createContextTrimMiddleware } from './context-trim.mw.js';
 export { createCompactionMiddleware } from './compaction.mw.js';
 export { createProfileMiddleware } from './profile.mw.js';
+export { createQuotaMiddleware, QUOTA_SCOPE_KEY } from './quota.mw.js';
 export {
   createSafetyMiddleware,
   readSafetyAudit,
@@ -56,6 +59,18 @@ export interface DefaultPipelineOptions {
     session?: Session;
     onVerdict?: (entry: SafetyAuditEntry) => void;
   };
+  /**
+   * v0.11 配额服务。**传了就取代 `budget-guard`** ——
+   * 后者读的是进程内计数器，活不过一个 HTTP 请求（见 quota.mw.ts 的说明）。
+   *
+   * 不传则保留 `budget-guard`：单进程 CLI / 纯内存测试仍然可用，
+   * 只是它限的是「单次 run 内」的用量，名副其实而已。
+   */
+  quota?: {
+    service: QuotaService;
+    tenantId?: string | null;
+    onExceeded?: (scope: 'tenant' | 'session', reason: string) => void;
+  };
 }
 
 /**
@@ -64,8 +79,8 @@ export interface DefaultPipelineOptions {
  * 顺序是刻意的：
  * 1. `safety`       最先 —— 恶意输入不该走到后面任何一步，更不该消耗 token；
  *                   同一实例的 `afterTurn` 兼管输出脱敏（v0.10 合并了原来的两个过滤器）
- * 2. `context-trim` 在预算检查前 —— 先把该丢的历史丢掉，再判断预算，否则可能误熔断
- * 3. `budget-guard` 裁剪之后 —— 判断的是真实将要发出的规模
+ * 2. `context-trim` 在配额检查前 —— 先把该丢的历史丢掉，再判断用量，否则可能误熔断
+ * 3. `quota`（或退化的 `budget-guard`）裁剪之后 —— 判断的是真实将要发出的规模
  */
 export function buildDefaultPipeline(opts: DefaultPipelineOptions): Pipeline {
   const {
@@ -85,9 +100,16 @@ export function buildDefaultPipeline(opts: DefaultPipelineOptions): Pipeline {
     ...(opts.enrich ?? []),
     ...(opts.beforeTrim ?? []),
     createContextTrimMiddleware(new ContextManager(maxMessages)),
-    createBudgetGuardMiddleware(
-      new BudgetGuard(tracker, maxTokens, warningThreshold),
-      onWarn
-    ),
+    opts.quota
+      ? createQuotaMiddleware({
+          quota: opts.quota.service,
+          tenantId: opts.quota.tenantId,
+          onExceeded: opts.quota.onExceeded,
+          onWarn,
+        })
+      : createBudgetGuardMiddleware(
+          new BudgetGuard(tracker, maxTokens, warningThreshold),
+          onWarn
+        ),
   ]);
 }

@@ -87,6 +87,16 @@ export class SseWriter {
     this.safeWrite(frame('safety', payload));
   }
 
+  /**
+   * 配额越限（v0.11）。
+   *
+   * 流中途才越限的情况走这里 —— 响应头已经是 200，改不成 429 了。
+   * `scope` 让客户端能区分「换个会话继续」和「你欠费了」。
+   */
+  writeQuota(payload: { scope: 'tenant' | 'session'; reason: string }): void {
+    this.safeWrite(frame('quota', payload));
+  }
+
   writeEvent(event: AgentEvent): void {
     this.safeWrite(agentEventToSse(event));
   }
