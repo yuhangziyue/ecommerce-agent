@@ -24,6 +24,8 @@ export interface ToolContext {
   sessionId: string;
   userId?: string | null;
   tenantId?: string | null;
+  /** v0.15：跨进程链路号。工具服务打日志时带上它，一次对话的动作才串得起来 */
+  traceId?: string;
 }
 
 // AgentTool - 工具定义（泛型，带TypeBox schema）
@@ -36,6 +38,7 @@ export interface AgentTool<T = any> {
 }
 
 import type { ToolArtifact } from '../artifacts/types.js';
+import type { ToolDescriptor } from '../tools/gateway.js';
 export type { ToolArtifact } from '../artifacts/types.js';
 
 // Message types
@@ -188,7 +191,12 @@ export interface ChatProvider {
   chat(
     systemPrompt: string,
     messages: Message[],
-    tools: AgentTool[],
+    /**
+     * v0.15：从 `AgentTool[]` 换成 `ToolDescriptor[]` —— 模型只需要
+     * 名称/描述/schema，不需要（也不该拿到）可执行的函数对象。
+     * `AgentTool` 结构上兼容 `ToolDescriptor`，既有调用方不受影响。
+     */
+    tools: ToolDescriptor[],
     opts?: ChatOptions
   ): Promise<ChatResponse>;
   getModel(): string;

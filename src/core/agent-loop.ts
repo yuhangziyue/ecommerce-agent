@@ -4,6 +4,12 @@ import { Session } from './session.js';
 import { Pipeline, type TurnContext } from './pipeline.js';
 import { EventBus } from './event-bus.js';
 import type { ToolRegistry } from '../tools/tool-registry.js';
+import {
+  LocalToolGateway,
+  newTraceId,
+  type ToolDescriptor,
+  type ToolGateway,
+} from '../tools/gateway.js';
 import type { TrajectoryLogger } from '../evaluation/trajectory-logger.js';
 import type { StreamingRedactor } from '../safety/streaming-redactor.js';
 import type {
@@ -23,7 +29,8 @@ import type {
  */
 interface ToolPlan {
   toolUse: ToolUse;
-  tool?: AgentTool;
+  /** v0.15：描述符而非可执行对象 —— 后者跨不了进程 */
+  tool?: ToolDescriptor;
   /** 非空表示这个调用不进入执行阶段（工具不存在 / 参数不合法 / 用户拒绝） */
   error?: ToolResult;
   durationMs?: number;
@@ -60,7 +67,12 @@ export type ConfirmHandler = (
  */
 export interface AgentLoopDeps {
   config: AgentConfig;
-  registry: ToolRegistry;
+  /**
+   * v0.15：从 `ToolRegistry` 具体类换成 `ToolGateway` 接口。
+   * 前者持有可执行的函数对象，跨不了进程 —— 那一个字段就把工具和编排
+   * 绑死在同一个进程里。传 registry 仍然可用（自动包成 LocalToolGateway）。
+   */
+  registry: ToolRegistry | ToolGateway;
   session: Session;
   /** 缺省时按 config 构造真实 ModelProvider；测试注入脚本化假实现 */
   provider?: ChatProvider;
@@ -87,11 +99,13 @@ export interface AgentLoopDeps {
    * **异步不阻塞**：落账失败只警告不中断对话（与审计写入同一原则）。
    */
   onUsage?: (record: CostRecord) => void | Promise<void>;
+  /** v0.15：跨进程链路号。HTTP 层从请求头取或新建，一路透传到工具服务 */
+  traceId?: string;
 }
 
 export class AgentLoop {
   private readonly provider: ChatProvider;
-  private readonly registry: ToolRegistry;
+  private readonly tools: ToolGateway;
   private readonly tracker: TokenTracker;
   private readonly session: Session;
   private readonly config: AgentConfig;
@@ -100,11 +114,16 @@ export class AgentLoop {
   private readonly onConfirm: ConfirmHandler;
   private readonly redactorFactory?: () => StreamingRedactor;
   private readonly onUsage?: (record: CostRecord) => void | Promise<void>;
+  /** v0.15：本轮链路号。由调用方给，缺省自生成 */
+  private readonly traceId: string;
   private conversationMessages: Message[] = [];
 
   constructor(deps: AgentLoopDeps) {
     this.config = deps.config;
-    this.registry = deps.registry;
+    this.tools =
+      'execute' in deps.registry
+        ? (deps.registry as ToolGateway)
+        : new LocalToolGateway(deps.registry as ToolRegistry);
     this.session = deps.session;
     this.provider =
       deps.provider ?? new ModelProvider(deps.config.model, deps.config.apiKey);
@@ -113,6 +132,7 @@ export class AgentLoop {
     this.onConfirm = deps.onConfirm ?? (async () => true);
     this.redactorFactory = deps.redactor;
     this.onUsage = deps.onUsage;
+    this.traceId = deps.traceId ?? newTraceId();
 
     // v0.4：事件分发收敛到总线。`onEvent` 与 `trajectory` 从「Loop 的两套并行机制」
     // 降级为两个普通订阅者 —— 调用方签名不变，但 v0.6 的 SSE 写出器可以直接
@@ -188,9 +208,10 @@ export class AgentLoop {
 
         // 按本轮路由结果收窄工具面。注册表本身不变 —— 过滤只影响这一轮
         // 发给模型的列表，不影响工具能否被执行（见 TurnContext.allowedTools）
+        const allTools = await this.tools.list();
         const visibleTools = ctx.allowedTools
-          ? this.registry.getAll().filter((t) => ctx.allowedTools!.includes(t.name))
-          : this.registry.getAll();
+          ? allTools.filter((t) => ctx.allowedTools!.includes(t.name))
+          : allTools;
 
         response = await this.provider.chat(
           systemPrompt,
@@ -278,37 +299,34 @@ export class AgentLoop {
     toolUses: ToolUse[],
     toolsUsed: string[]
   ): Promise<void> {
-    // 阶段 1：全量规划
-    const plans: ToolPlan[] = toolUses.map((toolUse) => {
-      const tool = this.registry.get(toolUse.name);
-      if (!tool) {
-        return {
-          toolUse,
-          error: {
-            content:
-              `工具 "${toolUse.name}" 不存在。可用工具: ` +
-              this.registry
-                .getAll()
-                .map((t) => t.name)
-                .join(', '),
-            isError: true,
-          },
-        };
-      }
+    // 阶段 1：全量规划（网关是异步的 —— 远程模式下查工具表要走网络）
+    const available = await this.tools.list();
+    const plans: ToolPlan[] = await Promise.all(
+      toolUses.map(async (toolUse): Promise<ToolPlan> => {
+        const tool = available.find((t) => t.name === toolUse.name);
+        if (!tool) {
+          return {
+            toolUse,
+            error: {
+              content:
+                `工具 "${toolUse.name}" 不存在。可用工具: ` +
+                available.map((t) => t.name).join(', '),
+              isError: true,
+            },
+          };
+        }
 
-      const validation = this.registry.validate(toolUse.name, toolUse.input);
-      if (!validation.ok) {
-        return {
-          toolUse,
-          error: {
-            content: `参数校验失败: ${validation.error}`,
-            isError: true,
-          },
-        };
-      }
+        const validation = await this.tools.validate(toolUse.name, toolUse.input);
+        if (!validation.ok) {
+          return {
+            toolUse,
+            error: { content: `参数校验失败: ${validation.error}`, isError: true },
+          };
+        }
 
-      return { toolUse, tool };
-    });
+        return { toolUse, tool };
+      })
+    );
 
     // 阶段 2：高风险串行确认
     for (const plan of plans) {
@@ -340,7 +358,6 @@ export class AgentLoop {
           return plan.error;
         }
 
-        const tool = plan.tool!;
         this.emit({
           type: 'tool_start',
           toolName: plan.toolUse.name,
@@ -355,10 +372,11 @@ export class AgentLoop {
         const startTime = Date.now();
         let result: ToolResult;
         try {
-          result = await tool.execute(plan.toolUse.input, {
+          result = await this.tools.execute(plan.toolUse.name, plan.toolUse.input, {
             sessionId: this.session.getId(),
             userId: this.session.getUserId(),
             tenantId: this.session.getTenantId(),
+            traceId: this.traceId,
           });
         } catch (err: any) {
           result = { content: `工具执行出错: ${err.message}`, isError: true };

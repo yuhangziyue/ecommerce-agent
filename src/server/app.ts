@@ -27,6 +27,7 @@ import {
 import { INPUT_RULES, OUTPUT_RULES } from '../safety/rules.js';
 import type { ToolArtifact } from '../artifacts/types.js';
 import { MetricsRegistry } from '../observability/metrics.js';
+import { LocalToolGateway, newTraceId, type ToolGateway } from '../tools/gateway.js';
 import { buildMetrics, collectFrom, buildSafetyReport } from '../observability/collector.js';
 import { readSafetyAudit } from '../middleware/safety.mw.js';
 import { SafetyScanner } from '../safety/scanner.js';
@@ -63,6 +64,11 @@ export interface AppOptions {
   returnPolicy?: ReturnPolicy;
   /** v0.14 指标注册表。注入便于测试断言；缺省时内部新建 */
   metrics?: MetricsRegistry;
+  /**
+   * v0.15 工具网关。缺省用 `LocalToolGateway`（单进程，行为与 v0.14 完全一致）；
+   * 传 `RemoteToolGateway` 则工具在独立的 tool-service 里执行。
+   */
+  toolGateway?: ToolGateway;
 }
 
 const CHAT_BODY_SCHEMA = {
@@ -103,9 +109,11 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     },
   });
 
-  // 工具注册表与退款 store 是进程级的，装配一次
-  const registry = buildToolRegistry();
-  setRefundStore(stores.refunds);
+  // 工具注册表与退款 store 是进程级的，装配一次。
+  // v0.15：远程模式下这两样都不需要 —— 工具在 tool-service 里执行，
+  // 那两个模块级单例也跟着搬过去了
+  const toolGateway = opts.toolGateway ?? new LocalToolGateway(buildToolRegistry());
+  if (!opts.toolGateway) setRefundStore(stores.refunds);
 
   const sharedProvider = opts.provider ?? new ModelProvider(config.model, config.apiKey);
   const compactor = new SummaryCompactor({ provider: sharedProvider, model: config.model });
@@ -202,6 +210,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
    */
   async function prepareTurn(
     body: ChatBody,
+    traceId: string,
     hooks: {
       onIntent?: (state: IntentState) => void;
       onRouted?: (agent: DomainAgent) => void;
@@ -260,7 +269,8 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     const tenantId = session.getTenantId() || ANONYMOUS_TENANT;
     const loop = new AgentLoop({
       config,
-      registry,
+      registry: toolGateway,
+      traceId,
       session,
       bus,
       tracker,
@@ -366,7 +376,8 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     { schema: { body: CHAT_BODY_SCHEMA } },
     async (request, reply) => {
       let writer: SseWriter | undefined;
-      const prepared = await prepareTurn(request.body, {
+      const traceId = (request.headers['x-trace-id'] as string) || newTraceId();
+      const prepared = await prepareTurn(request.body, traceId, {
         onIntent: (state) =>
           writer?.writeIntent({
             intent: state.intent,
@@ -409,6 +420,8 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         'Cache-Control': 'no-cache, no-transform',
         Connection: 'keep-alive',
         'X-Session-Id': session.getId(),
+        // 链路号回给调用方 —— 客户报障时给这个号就能定位整条链路
+        'X-Trace-Id': traceId,
       });
 
       writer = new SseWriter(reply.raw);
@@ -437,7 +450,8 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     '/v1/chat/sync',
     { schema: { body: CHAT_BODY_SCHEMA } },
     async (request, reply) => {
-      const prepared = await prepareTurn(request.body);
+      const traceId = (request.headers['x-trace-id'] as string) || newTraceId();
+      const prepared = await prepareTurn(request.body, traceId);
       if (!prepared.ok) {
         return reply
           .status(prepared.status)
@@ -458,8 +472,9 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       const reply_text = await loop.run(request.body.message);
       const summary = tracker.getSummary();
 
-      return reply.send({
+      return reply.header('X-Trace-Id', traceId).send({
         session_id: session.getId(),
+        trace_id: traceId,
         reply: reply_text,
         artifacts: artifacts.map((a) => ({
           tool: a.tool,
