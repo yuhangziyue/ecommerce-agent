@@ -2,6 +2,7 @@ import { ModelProvider } from './model-provider.js';
 import { TokenTracker } from './token-tracker.js';
 import { Session } from './session.js';
 import { Pipeline, type TurnContext } from './pipeline.js';
+import { EventBus } from './event-bus.js';
 import type { ToolRegistry } from '../tools/tool-registry.js';
 import type { ResponseScorer } from '../evaluation/response-scorer.js';
 import type { TrajectoryLogger } from '../evaluation/trajectory-logger.js';
@@ -50,6 +51,8 @@ export interface AgentLoopDeps {
   /** 与 pipeline 里的 BudgetGuard 共享同一实例，否则两边各记一份账 */
   tracker?: TokenTracker;
   onEvent?: EventHandler;
+  /** 直接注入总线（v0.6 SSE 适配器用）；缺省时内部新建 */
+  bus?: EventBus;
   onConfirm?: ConfirmHandler;
   scorer?: ResponseScorer;
   trajectory?: TrajectoryLogger;
@@ -62,10 +65,9 @@ export class AgentLoop {
   private readonly session: Session;
   private readonly config: AgentConfig;
   private readonly pipeline: Pipeline;
-  private readonly onEvent: EventHandler;
+  private readonly bus: EventBus;
   private readonly onConfirm: ConfirmHandler;
   private readonly scorer?: ResponseScorer;
-  private readonly trajectory?: TrajectoryLogger;
   private conversationMessages: Message[] = [];
 
   constructor(deps: AgentLoopDeps) {
@@ -76,10 +78,18 @@ export class AgentLoop {
       deps.provider ?? new ModelProvider(deps.config.model, deps.config.apiKey);
     this.tracker = deps.tracker ?? new TokenTracker();
     this.pipeline = deps.pipeline ?? new Pipeline([]);
-    this.onEvent = deps.onEvent ?? (() => {});
     this.onConfirm = deps.onConfirm ?? (async () => true);
     this.scorer = deps.scorer;
-    this.trajectory = deps.trajectory;
+
+    // v0.4：事件分发收敛到总线。`onEvent` 与 `trajectory` 从「Loop 的两套并行机制」
+    // 降级为两个普通订阅者 —— 调用方签名不变，但 v0.6 的 SSE 写出器可以直接
+    // getEventBus().subscribe(...) 挂上来，不需要再改 Loop。
+    this.bus = deps.bus ?? new EventBus();
+    if (deps.onEvent) this.bus.subscribe(deps.onEvent);
+    if (deps.trajectory) {
+      const trajectory = deps.trajectory;
+      this.bus.subscribe((event) => trajectory.log(event));
+    }
 
     // 恢复已有 session 中的消息
     const existingMessages = deps.session.getMessages();
@@ -131,7 +141,8 @@ export class AgentLoop {
         response = await this.provider.chat(
           this.config.systemPrompt,
           this.conversationMessages,
-          this.registry.getAll()
+          this.registry.getAll(),
+          { onDelta: (text) => this.emit({ type: 'delta', text }) }
         );
       } catch (err: any) {
         const errorMsg = `LLM调用失败: ${err.message}`;
@@ -341,8 +352,12 @@ export class AgentLoop {
   }
 
   private emit(event: AgentEvent): void {
-    this.onEvent(event);
-    this.trajectory?.log(event);
+    this.bus.emit(event);
+  }
+
+  /** 供外部订阅事件流（v0.6 的 SSE 写出器、v0.14 的指标埋点） */
+  getEventBus(): EventBus {
+    return this.bus;
   }
 
   private emitDone(): void {

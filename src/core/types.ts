@@ -88,6 +88,11 @@ export interface AgentConfig {
 // Agent events (流式事件)
 export type AgentEvent =
   | { type: 'thinking'; content: string }
+  /**
+   * 模型输出的增量文本块（v0.4）。
+   * 感知等待时间由**首字延迟**主导而非总时长，所以逐块吐出不是性能优化，是可用性问题。
+   */
+  | { type: 'delta'; text: string }
   | { type: 'tool_start'; toolName: string; input: Record<string, unknown> }
   | { type: 'tool_end'; toolName: string; result: ToolResult; durationMs: number }
   | { type: 'response'; content: string }
@@ -113,11 +118,20 @@ export interface ChatResponse {
  * AgentLoop 依赖此接口而非 ModelProvider 具体类 —— 这样测试可以注入脚本化的假实现，
  * 从而覆盖「循环终止 / 预算熔断 / 确认拒绝 / 工具报错回喂」这些不发真实请求就测不到的路径。
  */
+export interface ChatOptions {
+  /**
+   * 给了就逐块回调模型输出的文本增量，不给就只等最终结果。
+   * 调用方不必关心流式细节 —— `chat()` 的返回值始终是完整的 ChatResponse。
+   */
+  onDelta?(text: string): void;
+}
+
 export interface ChatProvider {
   chat(
     systemPrompt: string,
     messages: Message[],
-    tools: AgentTool[]
+    tools: AgentTool[],
+    opts?: ChatOptions
   ): Promise<ChatResponse>;
   getModel(): string;
 }

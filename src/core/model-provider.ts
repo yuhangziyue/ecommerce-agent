@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type {
   AgentTool,
+  ChatOptions,
   ChatProvider,
   ChatResponse,
   Message,
@@ -149,15 +150,27 @@ export class ModelProvider implements ChatProvider {
     });
   }
 
+  /**
+   * v0.4 起**一律走流式**（`messages.stream()`），不再用 `messages.create()`。
+   *
+   * 两个理由：
+   * 1. 体验 —— 有 `onDelta` 时能逐块吐字，感知等待时间由首字延迟主导而非总时长
+   * 2. 安全 —— 非流式请求在 max_tokens 较大时会撞 SDK 的 HTTP 超时；
+   *    v0.12 多步业务流、v0.13 结构化返回都会推高输出长度，流式是更安全的默认值
+   *
+   * 返回值仍是完整的 `ChatResponse`，调用方不必关心流式细节。
+   * 最终消息仍交给 `parseAnthropicResponse` —— 保住 v0.3 的并行 tool_use 收集行为。
+   */
   async chat(
     systemPrompt: string,
     messages: Message[],
-    tools: AgentTool<TSchema>[]
+    tools: AgentTool<TSchema>[],
+    opts?: ChatOptions
   ): Promise<ChatResponse> {
     const anthropicMessages = messagesToAnthropicFormat(messages);
     const anthropicTools = tools.map(toolToAnthropicSchema);
 
-    const response = await this.client.messages.create({
+    const stream = this.client.messages.stream({
       model: this.model,
       max_tokens: 4096,
       system: systemPrompt,
@@ -165,7 +178,13 @@ export class ModelProvider implements ChatProvider {
       ...(anthropicTools.length > 0 ? { tools: anthropicTools } : {}),
     });
 
-    return parseAnthropicResponse(response);
+    if (opts?.onDelta) {
+      // SDK 的 'text' 事件只吐文本增量，工具参数的 input_json_delta 不在其中
+      //（工具参数逐块渲染要到 v0.13 结构化返回协议才有意义）
+      stream.on('text', (text) => opts.onDelta!(text));
+    }
+
+    return parseAnthropicResponse(await stream.finalMessage());
   }
 
   getModel(): string {

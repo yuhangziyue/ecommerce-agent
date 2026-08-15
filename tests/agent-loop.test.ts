@@ -19,17 +19,29 @@ import type {
 class FakeProvider implements ChatProvider {
   calls = 0;
   lastToolCount = 0;
+  /** >0 时把 content 切成这么多块，通过 opts.onDelta 逐块回调（模拟流式） */
+  chunkCount = 0;
 
   constructor(private script: ChatResponse[]) {}
 
   async chat(
     _system: string,
     _messages: never,
-    tools: AgentTool[]
+    tools: AgentTool[],
+    opts?: { onDelta?(text: string): void }
   ): Promise<ChatResponse> {
     this.calls++;
     this.lastToolCount = tools.length;
-    return this.script.shift() ?? textReply('脚本已耗尽');
+    const response = this.script.shift() ?? textReply('脚本已耗尽');
+
+    if (this.chunkCount > 0 && opts?.onDelta && response.content) {
+      const size = Math.ceil(response.content.length / this.chunkCount);
+      for (let i = 0; i < response.content.length; i += size) {
+        opts.onDelta(response.content.slice(i, i + size));
+      }
+    }
+
+    return response;
   }
 
   getModel(): string {
@@ -654,6 +666,87 @@ describe('AgentLoop · 并行工具调用（v0.3 核心验收）', () => {
       .find((m) => m.role === 'assistant' && m.toolUses);
     expect(assistantWithTools!.toolUses).toHaveLength(2);
     expect(assistantWithTools!.toolUses!.map((t) => t.name)).toEqual(['t1', 't2']);
+  });
+});
+
+describe('AgentLoop · 流式输出（v0.4 核心验收）', () => {
+  it('delta 事件全部出现在 response 之前（首块先到，用户不再干等）', async () => {
+    const h = harness({ script: [textReply('您的订单已发货，顺丰派送中。')] });
+    h.provider.chunkCount = 5;
+
+    await h.loop.run('查订单');
+
+    const types = h.events.map((e) => e.type);
+    const lastDelta = types.lastIndexOf('delta');
+    const responseAt = types.indexOf('response');
+
+    expect(lastDelta).toBeGreaterThanOrEqual(0); // 确实有 delta
+    expect(responseAt).toBeGreaterThan(lastDelta); // 且全部早于 response
+  });
+
+  it('所有 delta 拼接 === 最终 response 内容（不丢块不重块）', async () => {
+    const full = '您的订单 ORD-20260801-001 已发货，顺丰 SF1234567890，预计明天送达。';
+    const h = harness({ script: [textReply(full)] });
+    h.provider.chunkCount = 7;
+
+    await h.loop.run('查订单');
+
+    const joined = h.events
+      .filter((e): e is Extract<AgentEvent, { type: 'delta' }> => e.type === 'delta')
+      .map((e) => e.text)
+      .join('');
+
+    expect(joined).toBe(full);
+
+    const response = h.events.find(
+      (e): e is Extract<AgentEvent, { type: 'response' }> => e.type === 'response'
+    );
+    expect(response!.content).toBe(full);
+  });
+
+  it('provider 不回调 onDelta 时行为与 v0.3 完全一致（向后兼容）', async () => {
+    const h = harness({ script: [textReply('不流式也能跑')] });
+    h.provider.chunkCount = 0;
+
+    const reply = await h.loop.run('你好');
+
+    expect(reply).toBe('不流式也能跑');
+    expect(h.events.some((e) => e.type === 'delta')).toBe(false);
+    expect(h.events.map((e) => e.type)).toEqual(['response', 'done']);
+  });
+
+  it('工具调用轮次的 delta 与最终回复的 delta 互不串台', async () => {
+    const h = harness({
+      script: [
+        toolReply('echo_tool', { text: 'x' }, '我先查一下'),
+        textReply('查到了'),
+      ],
+    });
+    h.provider.chunkCount = 3;
+
+    await h.loop.run('查');
+
+    // 第一轮的 content 是 thinking（伴随 tool_use），也会被逐块吐出
+    const deltas = h.events
+      .filter((e): e is Extract<AgentEvent, { type: 'delta' }> => e.type === 'delta')
+      .map((e) => e.text)
+      .join('');
+    expect(deltas).toBe('我先查一下查到了');
+  });
+
+  it('脱敏改写后 response 与 delta 可能不一致 —— 以 response 为准（delta 是预览）', async () => {
+    const h = harness({ script: [textReply('联系 13812345678')] });
+    h.provider.chunkCount = 4;
+
+    const reply = await h.loop.run('电话');
+
+    // delta 是模型原始输出的预览，afterTurn 脱敏发生在收口阶段
+    const joined = h.events
+      .filter((e): e is Extract<AgentEvent, { type: 'delta' }> => e.type === 'delta')
+      .map((e) => e.text)
+      .join('');
+    expect(joined).toBe('联系 13812345678');
+    expect(reply).toBe('联系 138****5678');
   });
 });
 

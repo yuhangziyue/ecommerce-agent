@@ -60,10 +60,16 @@ async function main() {
     path.join(process.cwd(), 'sessions', `${session.getId()}.events.jsonl`)
   );
 
+  // 流式与输出脱敏存在固有矛盾：delta 是模型原始输出，而 afterTurn 的脱敏/合规改写
+  // 发生在收口阶段 —— 也就是说未脱敏的内容**已经打到屏幕上了**。
+  // v0.4 的处理是「诚实纠正」：累积流式文本，若最终回复与之不同，明确告知已改写并给出准据版本。
+  // 真正的解法是流式感知的安全管道（逐块过滤 + 跨块模式的滞后窗口），归 v0.10。
+  let streamedText = '';
+
   const onEvent: EventHandler = (event) => {
     switch (event.type) {
       case 'thinking':
-        console.log(`\n💭 ${event.content}`);
+        process.stdout.write('\n');
         break;
       case 'tool_start':
         console.log(`\n🔧 调用工具: ${event.toolName}`);
@@ -73,8 +79,25 @@ async function main() {
           `   ${event.result.isError ? '⚠️ ' : '✅'} 工具完成 (${event.durationMs}ms)`
         );
         break;
+      case 'delta':
+        // 逐块吐字：用户不再等全量生成完才看到第一个字
+        if (streamedText === '') process.stdout.write('\n🤖 ');
+        streamedText += event.text;
+        process.stdout.write(event.text);
+        break;
       case 'response':
-        console.log(`\n🤖 ${event.content}`);
+        if (streamedText === '') {
+          // provider 没走流式（或本轮无文本增量）—— 一次性打印
+          console.log(`\n🤖 ${event.content}`);
+        } else if (event.content !== streamedText) {
+          // 已流式输出的内容被 afterTurn 改写过（脱敏/合规），必须告知并给准据版本
+          console.log(
+            `\n\n🛡️  上面的内容已被改写（脱敏/合规），以下为最终版本：\n🤖 ${event.content}`
+          );
+        } else {
+          process.stdout.write('\n');
+        }
+        streamedText = '';
         break;
       case 'blocked':
         console.log(`\n🛡️  已拦截 [${event.by}]：${event.reason}`);
