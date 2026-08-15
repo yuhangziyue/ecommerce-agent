@@ -7,6 +7,9 @@ import { refundApplyTool } from './refund-apply.js';
 import { humanHandoffTool } from './human-handoff.js';
 import { returnRequestTool, flowStatusTool } from './return-request.js';
 import { logisticsCheckTool } from './logistics-check.js';
+import { couponListTool } from './coupon.js';
+import { membershipInfoTool } from './membership.js';
+import { invoiceApplyTool } from './invoice.js';
 
 export { ToolRegistry } from './tool-registry.js';
 export { orderLookupTool } from './order-lookup.js';
@@ -16,6 +19,9 @@ export { refundApplyTool } from './refund-apply.js';
 export { humanHandoffTool } from './human-handoff.js';
 export { returnRequestTool, flowStatusTool, setFlowEngine } from './return-request.js';
 export { logisticsCheckTool, judgeLogistics } from './logistics-check.js';
+export { couponListTool, planCoupons } from './coupon.js';
+export { membershipInfoTool, resolveLevel } from './membership.js';
+export { invoiceApplyTool } from './invoice.js';
 
 /**
  * 全部工具的单一注册入口。
@@ -34,6 +40,10 @@ export const ALL_TOOLS: AgentTool[] = [
   returnRequestTool as AgentTool,
   flowStatusTool as AgentTool,
   logisticsCheckTool as AgentTool,
+  // v0.13 电商场景 II
+  couponListTool as AgentTool,
+  membershipInfoTool as AgentTool,
+  invoiceApplyTool as AgentTool,
 ];
 
 export function buildToolRegistry(tools: AgentTool[] = ALL_TOOLS): ToolRegistry {

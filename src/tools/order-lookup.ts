@@ -74,8 +74,31 @@ export const orderLookupTool: AgentTool<typeof OrderLookupParams> = {
       })
       .join('\n---\n');
 
+    // v0.13：只有单个订单时给订单卡。多个订单时不给 —— artifact 的类型是
+    // `order_card`（单数），硬塞第一条会让调用方以为「查到的就这一个」
+    const artifact =
+      results.length === 1
+        ? ({
+            type: 'order_card' as const,
+            data: {
+              orderId: results[0].orderId,
+              status: results[0].status,
+              statusLabel: STATUS_LABEL[results[0].status] ?? results[0].status,
+              totalAmount: results[0].totalAmount,
+              createTime: results[0].createTime,
+              items: results[0].items.map((i) => ({
+                name: i.name,
+                quantity: i.quantity,
+                price: i.price,
+              })),
+              tracking: results[0].tracking ?? null,
+            },
+          })
+        : undefined;
+
     return {
       content: formatted,
+      artifact,
       metadata: {
         count: results.length,
         orderIds: results.map((o) => o.orderId),

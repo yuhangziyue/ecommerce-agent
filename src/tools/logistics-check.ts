@@ -126,6 +126,16 @@ export const logisticsCheckTool: AgentTool<typeof LogisticsCheckParams> = {
         `运单信息: ${tracking}\n` +
         `异常判定: ${verdict.issue === 'none' ? '无异常' : verdict.issue}\n` +
         `处置建议: ${verdict.advice}`,
+      artifact: {
+        type: 'logistics',
+        data: {
+          orderId: params.orderId,
+          issue: verdict.issue,
+          daysSinceOrder: verdict.daysSinceOrder,
+          tracking: order.tracking ?? null,
+          hasIssue: verdict.issue !== 'none',
+        },
+      },
       metadata: {
         issue: verdict.issue,
         daysSinceOrder: verdict.daysSinceOrder,

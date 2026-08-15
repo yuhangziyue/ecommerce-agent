@@ -1,8 +1,16 @@
 // ToolResult - 工具返回
 export interface ToolResult {
+  /** 给**模型**看的自然语言。模型据此组织回复 */
   content: string;
   isError?: boolean;
   metadata?: Record<string, unknown>;
+  /**
+   * 给**调用方**看的结构化数据（v0.13）。
+   *
+   * 可选：不产出的工具行为不变。产出的会直接流到 SSE 与响应体，
+   * **不经过模型** —— 所以模型换个说法不会让调用方的解析崩掉。
+   */
+  artifact?: ToolArtifact;
 }
 
 /**
@@ -26,6 +34,9 @@ export interface AgentTool<T = any> {
   riskLevel: 'low' | 'medium' | 'high';
   execute: (params: any, ctx?: ToolContext) => Promise<ToolResult>;
 }
+
+import type { ToolArtifact } from '../artifacts/types.js';
+export type { ToolArtifact } from '../artifacts/types.js';
 
 // Message types
 export type Role = 'user' | 'assistant' | 'system' | 'tool';
@@ -129,6 +140,11 @@ export type AgentEvent =
   | { type: 'delta'; text: string }
   | { type: 'tool_start'; toolName: string; input: Record<string, unknown> }
   | { type: 'tool_end'; toolName: string; result: ToolResult; durationMs: number }
+  /**
+   * 工具产出的结构化数据（v0.13）。单独一帧，便于客户端只订阅它做界面渲染，
+   * 不必从 tool_end 里挑。
+   */
+  | { type: 'artifact'; toolName: string; artifact: ToolArtifact }
   | { type: 'response'; content: string }
   | { type: 'error'; error: string }
   /** 被中间件拦截（注入检测 / 预算熔断 / 后续版本的合规与配额）；by 为中间件名 */

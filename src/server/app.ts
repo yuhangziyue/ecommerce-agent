@@ -18,6 +18,14 @@ import { buildReturnFlow, DEFAULT_RETURN_POLICY, RETURN_STATE_LABELS, type Retur
 import { ConfirmationService, summarizeToolCall } from '../flows/confirmation.js';
 import { setFlowEngine } from '../tools/return-request.js';
 import type { ConfirmationRecord } from '../flows/types.js';
+import {
+  CachedTenantConfig,
+  resolveSafetyRules,
+  resolveReturnPolicy,
+  resolveQuotaLimits,
+} from '../tenants/config.js';
+import { INPUT_RULES, OUTPUT_RULES } from '../safety/rules.js';
+import type { ToolArtifact } from '../artifacts/types.js';
 import { SafetyScanner } from '../safety/scanner.js';
 import { DEFAULT_SAFETY_LAG } from '../safety/rules.js';
 import { buildToolRegistry } from '../tools/index.js';
@@ -106,18 +114,34 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     perSession: config.maxTokensPerSession,
     perTenant: 0, // 缺省不限租户；生产按合同配置
   };
-  const quota = new QuotaService(
-    await createQuotaCounter(stores.usage, process.env.REDIS_URL),
-    quotaLimits
-  );
+  const quotaCounter = await createQuotaCounter(stores.usage, process.env.REDIS_URL);
 
   // v0.12：流程引擎与确认服务都是进程级的，装配一次。
   // 会话号不在这里绑定 —— 工具执行时从 ToolContext 拿，否则并发下会串会话。
-  const flows = new FlowEngine(stores.flows, [
-    buildReturnFlow(opts.returnPolicy ?? DEFAULT_RETURN_POLICY),
-  ]);
+  const basePolicy = opts.returnPolicy ?? DEFAULT_RETURN_POLICY;
+  const flows = new FlowEngine(stores.flows, [buildReturnFlow(basePolicy)]);
   setFlowEngine(flows);
   const confirmations = new ConfirmationService(stores.confirmations);
+
+  // v0.13：租户配置带进程内缓存。配置读多写极少，每请求查库是纯浪费；
+  // 不设 TTL、只在写入时失效 —— 「改了配置要等几分钟生效」不该需要向运营解释
+  const tenantConfigs = new CachedTenantConfig(stores.tenantConfigs);
+
+  /**
+   * 按租户解析出本次请求生效的配置。
+   *
+   * 安全规则是**叠加**：全局规则全部保留，租户只能追加。
+   * 允许替换的话，一个租户的配置失误就能关掉全局的注入防护，且没有任何报错。
+   */
+  async function resolveForTenant(tenantId: string | null) {
+    const cfg = await tenantConfigs.get(tenantId);
+    return {
+      inputRules: resolveSafetyRules(INPUT_RULES, cfg?.extraSafetyRules?.input),
+      outputRules: resolveSafetyRules(OUTPUT_RULES, cfg?.extraSafetyRules?.output),
+      returnPolicy: resolveReturnPolicy(basePolicy, cfg?.returnPolicy),
+      quotaLimits: resolveQuotaLimits(quotaLimits, cfg?.quotaLimits),
+    };
+  }
 
   /** 在默认管道上挂两个记忆中间件（顺序约束由 buildDefaultPipeline 内部保证） */
   function buildMemoryPipeline(o: {
@@ -129,15 +153,22 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     onRouted?: (agent: DomainAgent) => void;
     onSafety?: (entry: SafetyAuditEntry) => void;
     onQuotaExceeded?: (scope: 'tenant' | 'session', reason: string) => void;
+    resolved: Awaited<ReturnType<typeof resolveForTenant>>;
   }): Pipeline {
     return buildDefaultPipeline({
       tracker: o.tracker,
       maxTokens: config.maxTokensPerSession,
       maxMessages: 20,
-      safety: { session: o.session, onVerdict: o.onSafety },
+      safety: {
+        session: o.session,
+        onVerdict: o.onSafety,
+        // v0.13：按租户解析出的规则（全局 + 租户追加）
+        inputScanner: new SafetyScanner(o.resolved.inputRules),
+        outputScanner: new SafetyScanner(o.resolved.outputRules),
+      },
       // v0.11：配额读账本而非进程内计数器 —— 这才让 maxTokensPerSession 名副其实
       quota: {
-        service: quota,
+        service: new QuotaService(quotaCounter, o.resolved.quotaLimits),
         tenantId: o.tenantId,
         onExceeded: o.onQuotaExceeded,
       },
@@ -192,11 +223,16 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       });
     }
 
+    const resolved = await resolveForTenant(session.getTenantId());
+
     // ── 配额预检 ──
     // 必须在这里做，而不是只靠管道里的 quota 中间件：SSE 一旦写出响应头就是 200，
     // 之后再发现租户欠费也没法改成 429 了。管道里那道检查负责工具循环中途越限，
     // 两道不是重复 —— 它们拦的是不同时刻。
-    const preflight = await quota.check({
+    // 按租户配额判定 —— 不同租户可以有不同上限（v0.11 建立了账本维度，
+    // 但上限一直是全局的；本版补上）
+    const tenantQuota = new QuotaService(quotaCounter, resolved.quotaLimits);
+    const preflight = await tenantQuota.check({
       tenantId: session.getTenantId(),
       sessionId: session.getId(),
     });
@@ -228,6 +264,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         onRouted: hooks.onRouted,
         onSafety: hooks.onSafety,
         onQuotaExceeded: hooks.onQuotaExceeded,
+        resolved,
       }),
       // v0.11：每次模型调用落一条账，并同步配额计数器。
       // 落账失败只警告不中断（AgentLoop 内部已 try/catch）—— 但配额检查失败必须拦，
@@ -253,7 +290,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
           at: record.timestamp,
         });
 
-        await quota.record({
+        await tenantQuota.record({
           tenantId: session!.getTenantId(),
           sessionId: session!.getId(),
           billableTokens: billable,
@@ -392,8 +429,13 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
 
       const { session, loop, bus, tracker } = prepared;
       const blocked: { by: string; reason: string }[] = [];
+      // v0.13：非流式调用方也要能拿到结构化数据，否则只能去解析 reply 里的中文
+      const artifacts: Array<{ tool: string; artifact: ToolArtifact }> = [];
       bus.subscribe((event) => {
         if (event.type === 'blocked') blocked.push({ by: event.by, reason: event.reason });
+        if (event.type === 'artifact') {
+          artifacts.push({ tool: event.toolName, artifact: event.artifact });
+        }
       });
 
       const reply_text = await loop.run(request.body.message);
@@ -402,6 +444,11 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       return reply.send({
         session_id: session.getId(),
         reply: reply_text,
+        artifacts: artifacts.map((a) => ({
+          tool: a.tool,
+          type: a.artifact.type,
+          data: a.artifact.data,
+        })),
         blocked: blocked.length > 0 ? blocked : undefined,
         usage: {
           input_tokens: summary.totalInputTokens,
@@ -567,6 +614,102 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         note: t.note ?? null,
         at: t.at,
       })),
+    });
+  });
+
+  // ============ 结构化数据回放与租户配置（v0.13） ============
+
+  /**
+   * 回放整个会话产出的结构化数据。
+   *
+   * 从 session 的 tool_result 条目里提取 —— 客户端断线重连后不必重跑对话
+   * 就能恢复界面（商品卡、订单卡、流程状态）。
+   */
+  app.get<{ Params: { id: string } }>(
+    '/v1/sessions/:id/artifacts',
+    async (request, reply) => {
+      const session = await Session.restore(stores.sessions, request.params.id);
+      if (!session) {
+        return reply
+          .status(404)
+          .send(errorBody('session_not_found', `会话 ${request.params.id} 不存在`));
+      }
+
+      const artifacts = session
+        .getEntries()
+        .filter((e) => e.type === 'tool_result')
+        .map((e) => e.data as { toolUseId: string; result: { artifact?: ToolArtifact } })
+        .filter((d) => d.result?.artifact)
+        .map((d) => ({
+          tool_use_id: d.toolUseId,
+          type: d.result.artifact!.type,
+          data: d.result.artifact!.data,
+        }));
+
+      return reply.send({ session_id: request.params.id, artifacts });
+    }
+  );
+
+  const TENANT_CONFIG_SCHEMA = {
+    type: 'object',
+    properties: {
+      return_policy: {
+        type: 'object',
+        properties: {
+          windowDays: { type: 'number' },
+          autoApproveAmount: { type: 'number' },
+        },
+        additionalProperties: false,
+      },
+      quota_limits: {
+        type: 'object',
+        properties: {
+          perSession: { type: 'number' },
+          perTenant: { type: 'number' },
+        },
+        additionalProperties: false,
+      },
+    },
+    additionalProperties: false,
+  } as const;
+
+  app.put<{
+    Params: { id: string };
+    Body: { return_policy?: Record<string, number>; quota_limits?: Record<string, number> };
+  }>(
+    '/v1/tenants/:id/config',
+    { schema: { body: TENANT_CONFIG_SCHEMA } },
+    async (request, reply) => {
+      // 安全规则刻意**不通过这个接口配置** —— HTTP 传正则再服务端 new RegExp，
+      // 等于开了一个 ReDoS 入口。规则变更走部署，不走运行时 API
+      const saved = await tenantConfigs.upsert({
+        tenantId: request.params.id,
+        returnPolicy: request.body.return_policy,
+        quotaLimits: request.body.quota_limits,
+      });
+
+      return reply.send({
+        tenant_id: saved.tenantId,
+        return_policy: saved.returnPolicy,
+        quota_limits: saved.quotaLimits,
+        updated_at: saved.updatedAt,
+      });
+    }
+  );
+
+  app.get<{ Params: { id: string } }>('/v1/tenants/:id/config', async (request, reply) => {
+    const cfg = await tenantConfigs.get(request.params.id);
+    const resolved = await resolveForTenant(request.params.id);
+    return reply.send({
+      tenant_id: request.params.id,
+      configured: cfg !== null,
+      // 返回**生效值**而不只是配置值 —— 运营要看的是「现在到底按什么执行」
+      effective: {
+        return_policy: resolved.returnPolicy,
+        quota_limits: resolved.quotaLimits,
+        input_rule_count: resolved.inputRules.length,
+        output_rule_count: resolved.outputRules.length,
+      },
     });
   });
 

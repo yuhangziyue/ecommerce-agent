@@ -36,7 +36,13 @@ describe('productSearchTool', () => {
     // category 服饰 has 6 items, should return only 5
     const result = await productSearchTool.execute({ category: '服饰' });
 
-    const segments = result.content.split('---');
-    expect(segments.length).toBeLessThanOrEqual(5);
+    // v0.13：断言结构而不是文案分段。原来的写法是数 `---` 的个数 ——
+    // 加一行「共 6 件匹配」的说明就会把它弄红，而行为一个字没变。
+    // 这正是本版要解决的问题：正确性判据不该建立在自然语言的排版上。
+    expect(result.artifact?.type).toBe('product_list');
+    const data = (result.artifact as any).data;
+    expect(data.products).toHaveLength(5);
+    expect(data.total).toBe(6);
+    expect(data.truncated).toBe(true);
   });
 });

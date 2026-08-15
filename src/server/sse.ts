@@ -31,6 +31,14 @@ export function agentEventToSse(event: AgentEvent): string {
         tool: event.toolName,
         duration_ms: event.durationMs,
         is_error: event.result.isError ?? false,
+        // v0.13：结构化数据也挂在这里一份，省得客户端为了拿它去订阅两个事件
+        artifact: event.result.artifact ?? null,
+      });
+    case 'artifact':
+      return frame('artifact', {
+        tool: event.toolName,
+        type: event.artifact.type,
+        data: event.artifact.data,
       });
     case 'response':
       return frame('response', { content: event.content });

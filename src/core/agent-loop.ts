@@ -367,6 +367,16 @@ export class AgentLoop {
           result,
           durationMs: plan.durationMs,
         });
+
+        // v0.13：结构化数据单独发一帧。**不经过模型** —— 这正是它存在的意义：
+        // 调用方渲染卡片不必去解析模型生成的自然语言
+        if (result.artifact) {
+          this.emit({
+            type: 'artifact',
+            toolName: plan.toolUse.name,
+            artifact: result.artifact,
+          });
+        }
         return result;
       })
     );

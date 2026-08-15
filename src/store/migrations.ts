@@ -182,6 +182,23 @@ CREATE TABLE IF NOT EXISTS confirmations (
 CREATE INDEX IF NOT EXISTS idx_confirmations_session ON confirmations (session_id, seq DESC);
 `,
   },
+  {
+    // v0.13 租户配置。还 v0.10（按租户配安全规则）与 v0.12（按租户配售后政策）的账。
+    //
+    // 安全规则存的是**追加项**而非全量：租户只能加严不能放宽，
+    // 存全量就等于允许替换，一个配置失误能把全局注入防护整个关掉。
+    name: '007_tenant_configs',
+    sql: `
+CREATE TABLE IF NOT EXISTS tenant_configs (
+  tenant_id          TEXT PRIMARY KEY,
+  extra_safety_rules JSONB NOT NULL DEFAULT '{}'::jsonb,
+  return_policy      JSONB NOT NULL DEFAULT '{}'::jsonb,
+  quota_limits       JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+`,
+  },
 ];
 
 /**

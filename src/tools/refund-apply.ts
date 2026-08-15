@@ -65,6 +65,16 @@ export const refundApplyTool: AgentTool<typeof RefundApplyParams> = {
         `退款金额: ¥${ticket.amount}\n` +
         `退款原因: ${ticket.reason}\n` +
         '预计 3-5 个工作日内处理完成，原路退回支付账户。',
+      artifact: {
+        type: 'refund_ticket',
+        data: {
+          refundId: ticket.refundId,
+          orderId: ticket.orderId,
+          amount: ticket.amount,
+          reason: ticket.reason,
+          duplicated: !created,
+        },
+      },
       metadata: {
         refundId: ticket.refundId,
         orderId: ticket.orderId,

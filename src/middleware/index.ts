@@ -8,6 +8,7 @@ import { createSafetyMiddleware, type SafetyAuditEntry } from './safety.mw.js';
 import { createQuotaMiddleware } from './quota.mw.js';
 import type { Session } from '../core/session.js';
 import type { QuotaService } from '../billing/quota.js';
+import type { SafetyScanner } from '../safety/scanner.js';
 
 export { createInputFilterMiddleware } from './input-filter.mw.js';
 export { createOutputFilterMiddleware } from './output-filter.mw.js';
@@ -58,6 +59,9 @@ export interface DefaultPipelineOptions {
   safety?: {
     session?: Session;
     onVerdict?: (entry: SafetyAuditEntry) => void;
+    /** v0.13：按租户解析出的扫描器（全局规则 + 租户追加）。缺省用全局规则 */
+    inputScanner?: SafetyScanner;
+    outputScanner?: SafetyScanner;
   };
   /**
    * v0.11 配额服务。**传了就取代 `budget-guard`** ——

@@ -154,6 +154,23 @@ export const flowStatusTool: AgentTool<typeof FlowStatusParams> = {
         (flow.data.rejectReason ? `拒绝原因: ${flow.data.rejectReason}\n` : '') +
         (flow.data.refundId ? `退款工单: ${flow.data.refundId}\n` : '') +
         `流转记录:\n${steps}`,
+      artifact: {
+        type: 'flow_status',
+        data: {
+          flowId: flow.id,
+          orderId: flow.subjectId,
+          state: flow.state,
+          stateLabel: RETURN_STATE_LABELS[flow.state] ?? flow.state,
+          availableEvents: engine.availableEvents(flow),
+          transitions: history.map((h) => ({
+            to: h.to,
+            toLabel: RETURN_STATE_LABELS[h.to] ?? h.to,
+            event: h.event,
+            actor: h.actor,
+            at: h.at,
+          })),
+        },
+      },
       metadata: { flowId: flow.id, state: flow.state },
     };
   },

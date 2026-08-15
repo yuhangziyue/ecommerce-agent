@@ -6,6 +6,7 @@ import { PgProfileStore } from './pg-profile-store.js';
 import { PgUsageStore } from './pg-usage-store.js';
 import { PgFlowStore } from './pg-flow-store.js';
 import { PgConfirmationStore } from './pg-confirmation-store.js';
+import { PgTenantConfigStore } from './pg-tenant-config-store.js';
 import { createSessionCache, CachedSessionStore, type SessionCache } from './session-cache.js';
 import type {
   Database,
@@ -15,6 +16,7 @@ import type {
   UsageStore,
 } from './types.js';
 import type { ConfirmationStore, FlowStore } from '../flows/types.js';
+import type { TenantConfigStore } from '../tenants/config.js';
 
 export * from './types.js';
 export { createDatabase, PGliteDatabase, PgPoolDatabase } from './database.js';
@@ -25,6 +27,7 @@ export { PgProfileStore, renderProfileContext } from './pg-profile-store.js';
 export { PgUsageStore, ANONYMOUS_TENANT } from './pg-usage-store.js';
 export { PgFlowStore } from './pg-flow-store.js';
 export { PgConfirmationStore } from './pg-confirmation-store.js';
+export { PgTenantConfigStore } from './pg-tenant-config-store.js';
 export {
   createSessionCache,
   CachedSessionStore,
@@ -43,6 +46,8 @@ export interface Stores {
   /** v0.12 业务流与异步确认 */
   flows: FlowStore;
   confirmations: ConfirmationStore;
+  /** v0.13 租户配置 */
+  tenantConfigs: TenantConfigStore;
   /** v0.7：会话热缓存。Redis 不可用时是 NoOp —— 服务照常工作，只是慢一点 */
   cache: SessionCache;
   close(): Promise<void>;
@@ -72,6 +77,7 @@ export async function openStores(
     usage: new PgUsageStore(db),
     flows: new PgFlowStore(db),
     confirmations: new PgConfirmationStore(db),
+    tenantConfigs: new PgTenantConfigStore(db),
     cache,
     close: async () => {
       await cache.close();
