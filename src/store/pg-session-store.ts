@@ -73,7 +73,7 @@ export class PgSessionStore implements SessionStore {
     const { rows } = await this.db.query<SessionRow>(
       `SELECT ${SESSION_COLUMNS} FROM sessions
        WHERE user_id = $1
-       ORDER BY created_at DESC, id DESC
+       ORDER BY seq DESC
        LIMIT $2`,
       [userId, limit]
     );
@@ -84,7 +84,7 @@ export class PgSessionStore implements SessionStore {
     const { rows } = await this.db.query<SessionRow>(
       `SELECT ${SESSION_COLUMNS} FROM sessions
        WHERE tenant_id = $1
-       ORDER BY created_at DESC, id DESC
+       ORDER BY seq DESC
        LIMIT $2`,
       [tenantId, limit]
     );

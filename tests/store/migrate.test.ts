@@ -15,7 +15,7 @@ describe('迁移机制', () => {
 
   it('首次执行返回所有迁移名', async () => {
     const executed = await runMigrations(db);
-    expect(executed).toEqual(['001_init']);
+    expect(executed).toEqual(['001_init', '002_sessions_seq']);
   });
 
   it('重复执行是幂等的（第二次返回空数组，不报错）', async () => {

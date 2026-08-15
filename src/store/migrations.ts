@@ -48,6 +48,26 @@ CREATE TABLE IF NOT EXISTS refund_tickets (
 );
 `,
   },
+  {
+    // v0.6 修复 v0.5 遗留的一个真 bug（由 flaky 测试暴露）：
+    //
+    // sessions 原来按 `created_at DESC, id DESC` 排序。但 PostgreSQL 的 now() 返回
+    // **事务开始时间** —— 同一毫秒创建的两个会话 created_at 完全相同，排序退化到
+    // id DESC，而 id 的后缀是**随机字符串**，与创建顺序无关 → 顺序随机。
+    //
+    // 讽刺的是 v0.5 刚为 session_entries 用 BIGSERIAL 解决过同一个问题，
+    // 却在 sessions 表上漏了。这里补上同样的单调序列。
+    name: '002_sessions_seq',
+    sql: `
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
+
+-- 按用户/租户列会话时用 seq 而非 created_at 排序
+DROP INDEX IF EXISTS idx_sessions_user;
+DROP INDEX IF EXISTS idx_sessions_tenant;
+CREATE INDEX IF NOT EXISTS idx_sessions_user_seq   ON sessions (user_id, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_tenant_seq ON sessions (tenant_id, seq DESC);
+`,
+  },
 ];
 
 /**

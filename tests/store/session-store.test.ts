@@ -173,6 +173,19 @@ describe('PgSessionStore', () => {
       expect(list.map((s) => s.id)).toEqual([b.id, a.id]); // 最新在前
     });
 
+    it('🔴 同一毫秒创建的会话仍按创建顺序倒序（v0.5 遗留 bug，flaky 测试暴露）', async () => {
+      // PostgreSQL 的 now() 返回事务开始时间 —— 同一毫秒创建的会话 created_at 完全相同。
+      // v0.5 的排序是 `created_at DESC, id DESC`，退化到 id 时按的是**随机后缀**，
+      // 与创建顺序无关 → 顺序随机。这条用例在旧实现下会随机失败（实测 3 次挂 1 次）。
+      const ids: string[] = [];
+      for (let i = 0; i < 8; i++) {
+        ids.push((await store.create({ userId: 'u-same-ms' })).id);
+      }
+
+      const list = await store.listByUser('u-same-ms');
+      expect(list.map((s) => s.id)).toEqual([...ids].reverse());
+    });
+
     it('listByUser 支持 limit', async () => {
       for (let i = 0; i < 5; i++) await store.create({ userId: 'u1' });
       expect(await store.listByUser('u1', 2)).toHaveLength(2);
