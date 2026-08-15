@@ -253,6 +253,37 @@ describe('POST /v1/chat（SSE）', () => {
     expect(intent![1].slots.orderId).toBe('ORD-1');
   });
 
+  it('SSE 出现 routing 事件，且按意图路由到对应领域（v0.9）', async () => {
+    provider.intentReply =
+      '{"intent":"refund","confidence":0.9,"slots":{"orderId":"ORD-1","reason":"不想要"}}';
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/chat',
+      payload: { message: '我要退款' },
+    });
+
+    const routing = parseSse(res.body).find((e) => e[0] === 'routing');
+    expect(routing).toBeDefined();
+    expect(routing![1].agent).toBe('aftersale');
+    expect(routing![1].tools).toContain('refund_apply');
+  });
+
+  it('售前意图路由到 presale 且工具面不含 refund_apply', async () => {
+    provider.intentReply =
+      '{"intent":"product_search","confidence":0.9,"slots":{"productKeyword":"耳机"}}';
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/chat',
+      payload: { message: '有什么好耳机' },
+    });
+
+    const routing = parseSse(res.body).find((e) => e[0] === 'routing')!;
+    expect(routing[1].agent).toBe('presale');
+    expect(routing[1].tools).not.toContain('refund_apply');
+  });
+
   it('缺 message → 400 且错误体是统一形状', async () => {
     const res = await app.inject({
       method: 'POST',

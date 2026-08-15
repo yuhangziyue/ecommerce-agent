@@ -68,6 +68,11 @@ export class SseWriter {
     this.safeWrite(frame('intent', payload));
   }
 
+  /** 路由结果（v0.9）：本轮由哪个领域 Agent 处理 */
+  writeRouting(payload: { agent: string; name: string; tools: string[] }): void {
+    this.safeWrite(frame('routing', payload));
+  }
+
   writeEvent(event: AgentEvent): void {
     this.safeWrite(agentEventToSse(event));
   }

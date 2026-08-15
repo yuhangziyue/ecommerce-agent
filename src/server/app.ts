@@ -15,6 +15,9 @@ import { createCompactionMiddleware } from '../middleware/compaction.mw.js';
 import { createProfileMiddleware } from '../middleware/profile.mw.js';
 import { createIntentMiddleware } from '../middleware/intent.mw.js';
 import { IntentRecognizer } from '../intent/recognizer.js';
+import { createRoutingMiddleware } from '../middleware/routing.mw.js';
+import { AgentRegistry } from '../agents/registry.js';
+import type { DomainAgent } from '../agents/types.js';
 import type { IntentState } from '../intent/types.js';
 import { Pipeline } from '../core/pipeline.js';
 import type { Stores } from '../store/index.js';
@@ -73,6 +76,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   const sharedProvider = opts.provider ?? new ModelProvider(config.model, config.apiKey);
   const compactor = new SummaryCompactor({ provider: sharedProvider, model: config.model });
   const recognizer = new IntentRecognizer({ provider: sharedProvider });
+  const agents = new AgentRegistry();
 
   /** 在默认管道上挂两个记忆中间件（顺序约束由 buildDefaultPipeline 内部保证） */
   function buildMemoryPipeline(o: {
@@ -80,6 +84,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     session: Session;
     userId: string | null;
     onIntent?: (state: IntentState) => void;
+    onRouted?: (agent: DomainAgent) => void;
   }): Pipeline {
     return buildDefaultPipeline({
       tracker: o.tracker,
@@ -92,6 +97,8 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
           session: o.session,
           onRecognized: o.onIntent,
         }),
+        // 必须排在 intent 之后 —— 它的输入是 ctx.metadata.intent
+        createRoutingMiddleware({ agents, onRouted: o.onRouted }),
       ],
       beforeTrim: [createCompactionMiddleware({ compactor, session: o.session })],
     });
@@ -104,7 +111,8 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
    */
   async function prepareTurn(
     body: ChatBody,
-    onIntent?: (state: IntentState) => void
+    onIntent?: (state: IntentState) => void,
+    onRouted?: (agent: DomainAgent) => void
   ): Promise<
     | { ok: true; session: Session; loop: AgentLoop; bus: EventBus; tracker: TokenTracker }
     | { ok: false; status: number; code: string; message: string }
@@ -142,6 +150,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         session,
         userId: session.getUserId(),
         onIntent,
+        onRouted,
       }),
       scorer: new ResponseScorer(),
       // 服务端没有交互式确认的通道：高风险工具一律拒绝，
@@ -166,7 +175,13 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
           phase: state.phase,
           slots: state.slots as Record<string, unknown>,
           missing: state.missing,
-        })
+        }),
+        (agent) =>
+          writer?.writeRouting({
+            agent: agent.id,
+            name: agent.name,
+            tools: agent.toolNames,
+          })
       );
       if (!prepared.ok) {
         return reply
@@ -294,6 +309,20 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       updated_at: profile.updatedAt,
     });
   });
+
+  // ============ 领域 Agent 列表（v0.9） ============
+
+  app.get('/v1/agents', async (_request, reply) =>
+    reply.send({
+      agents: agents.getAll().map((a) => ({
+        id: a.id,
+        name: a.name,
+        description: a.description,
+        intents: a.intents,
+        tools: a.toolNames.length > 0 ? a.toolNames : '*',
+      })),
+    })
+  );
 
   // ============ 健康检查 ============
 

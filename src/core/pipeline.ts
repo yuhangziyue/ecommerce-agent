@@ -20,6 +20,14 @@ export interface TurnContext {
    * 塞进 userInput 会把它写进历史，塞进 config.systemPrompt 会影响所有会话。
    */
   systemAppends: string[];
+  /**
+   * 本轮发给模型的工具白名单（v0.9 路由设置）。`undefined` 表示不限制。
+   *
+   * **这是引导不是鉴权**：收窄只影响「发给模型的工具列表」，
+   * 不影响工具的注册与执行 —— 模型若仍调用了子集外的工具，照常执行。
+   * 一次意图误判不该让合法请求失败。真正的权限控制归 v1.0 鉴权。
+   */
+  allowedTools?: string[];
   readonly metadata: Record<string, unknown>;
 }
 

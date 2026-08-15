@@ -103,6 +103,37 @@ describe('会话查询接口', () => {
   });
 });
 
+describe('GET /v1/agents', () => {
+  let db: Database;
+  let app: FastifyInstance;
+
+  beforeAll(async () => {
+    db = await openTestDb();
+    app = await buildApp({ stores: await makeTestStores(db), config, provider: stubProvider });
+    await app.ready();
+  });
+
+  afterAll(async () => {
+    await app.close();
+    await db.close();
+  });
+
+  it('返回全部领域 Agent 及其意图与工具', async () => {
+    const res = await app.inject({ method: 'GET', url: '/v1/agents' });
+    expect(res.statusCode).toBe(200);
+
+    const body = JSON.parse(res.body);
+    expect(body.agents.length).toBeGreaterThanOrEqual(5);
+
+    const ids = body.agents.map((a: any) => a.id);
+    expect(ids).toEqual(expect.arrayContaining(['presale', 'order', 'aftersale', 'general']));
+
+    // 兜底 Agent 的工具面用 * 表示全集
+    const general = body.agents.find((a: any) => a.id === 'general');
+    expect(general.tools).toBe('*');
+  });
+});
+
 describe('GET /healthz', () => {
   let db: Database;
   let app: FastifyInstance;

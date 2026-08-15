@@ -145,10 +145,16 @@ export class AgentLoop {
             ? `${this.config.systemPrompt}\n\n${ctx.systemAppends.join('\n\n')}`
             : this.config.systemPrompt;
 
+        // 按本轮路由结果收窄工具面。注册表本身不变 —— 过滤只影响这一轮
+        // 发给模型的列表，不影响工具能否被执行（见 TurnContext.allowedTools）
+        const visibleTools = ctx.allowedTools
+          ? this.registry.getAll().filter((t) => ctx.allowedTools!.includes(t.name))
+          : this.registry.getAll();
+
         response = await this.provider.chat(
           systemPrompt,
           this.conversationMessages,
-          this.registry.getAll(),
+          visibleTools,
           { onDelta: (text) => this.emit({ type: 'delta', text }) }
         );
       } catch (err: any) {

@@ -6,6 +6,7 @@ import type { Database, SessionStore } from '../src/store/types.js';
 import { ToolRegistry } from '../src/tools/tool-registry.js';
 import { TokenTracker } from '../src/core/token-tracker.js';
 import { buildDefaultPipeline } from '../src/middleware/index.js';
+import { Pipeline } from '../src/core/pipeline.js';
 import type {
   AgentConfig,
   AgentEvent,
@@ -768,6 +769,85 @@ describe('AgentLoop · 流式输出（v0.4 核心验收）', () => {
       .join('');
     expect(joined).toBe('联系 13812345678');
     expect(reply).toBe('联系 138****5678');
+  });
+});
+
+describe('AgentLoop · 工具收窄（v0.9 路由）', () => {
+  /** 用一个把 allowedTools 写进 ctx 的假中间件模拟路由结果 */
+  function narrowingPipeline(allowed: string[]) {
+    return new Pipeline([
+      {
+        name: 'fake-routing',
+        beforeTurn(ctx) {
+          ctx.allowedTools = allowed;
+          return { action: 'continue' as const };
+        },
+      },
+    ]);
+  }
+
+  it('🔴 只把子集内的工具发给模型', async () => {
+    const provider = new FakeProvider([textReply('ok')]);
+    const loop = new AgentLoop({
+      config: config(),
+      registry: registryWith(
+        mockTool({ name: 'product_search' }),
+        mockTool({ name: 'refund_apply', riskLevel: 'high' }),
+        mockTool({ name: 'faq_search' })
+      ),
+      session: await Session.create(testStore),
+      provider,
+      pipeline: narrowingPipeline(['product_search', 'faq_search']),
+    });
+
+    await loop.run('有什么好耳机');
+
+    // 售前场景不该看到高风险的退款工具
+    expect(provider.lastToolCount).toBe(2);
+  });
+
+  it('未设置 allowedTools 时发全部工具', async () => {
+    const provider = new FakeProvider([textReply('ok')]);
+    const loop = new AgentLoop({
+      config: config(),
+      registry: registryWith(mockTool({ name: 'a' }), mockTool({ name: 'b' })),
+      session: await Session.create(testStore),
+      provider,
+    });
+
+    await loop.run('随便');
+    expect(provider.lastToolCount).toBe(2);
+  });
+
+  it('🔴 不在子集里的工具仍可执行（收窄是引导不是鉴权）', async () => {
+    let executed = false;
+    const provider = new FakeProvider([
+      toolReply('refund_apply', { text: 'x' }),
+      textReply('已处理'),
+    ]);
+    const loop = new AgentLoop({
+      config: config({ confirmHighRisk: false }),
+      registry: registryWith(
+        mockTool({ name: 'product_search' }),
+        mockTool({
+          name: 'refund_apply',
+          execute: async () => {
+            executed = true;
+            return { content: 'done' };
+          },
+        })
+      ),
+      session: await Session.create(testStore),
+      provider,
+      // 本轮只暴露 product_search，但模型仍调用了 refund_apply
+      pipeline: narrowingPipeline(['product_search']),
+    });
+
+    const reply = await loop.run('退款');
+
+    // 一次意图误判不该让合法请求失败 —— 真正的权限控制归 v1.0 鉴权
+    expect(executed).toBe(true);
+    expect(reply).toBe('已处理');
   });
 });
 
