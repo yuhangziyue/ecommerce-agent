@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
     "verify": "npm run typecheck && npm test",
     "bench:stream": "tsx scripts/bench-streaming.ts",
-    "bench:quota": "tsx scripts/bench-quota.ts"
+    "bench:quota": "tsx scripts/bench-quota.ts",
+    "eval": "tsx scripts/eval.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

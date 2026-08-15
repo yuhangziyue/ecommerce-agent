@@ -26,12 +26,14 @@ import {
 } from '../tenants/config.js';
 import { INPUT_RULES, OUTPUT_RULES } from '../safety/rules.js';
 import type { ToolArtifact } from '../artifacts/types.js';
+import { MetricsRegistry } from '../observability/metrics.js';
+import { buildMetrics, collectFrom, buildSafetyReport } from '../observability/collector.js';
+import { readSafetyAudit } from '../middleware/safety.mw.js';
 import { SafetyScanner } from '../safety/scanner.js';
 import { DEFAULT_SAFETY_LAG } from '../safety/rules.js';
 import { buildToolRegistry } from '../tools/index.js';
 import { setRefundStore } from '../tools/refund-store.js';
 import { SYSTEM_PROMPT } from '../prompts/system-prompt.js';
-import { ResponseScorer } from '../evaluation/response-scorer.js';
 import { SseWriter } from './sse.js';
 import { SummaryCompactor } from '../memory/summary-compactor.js';
 import { createCompactionMiddleware } from '../middleware/compaction.mw.js';
@@ -59,6 +61,8 @@ export interface AppOptions {
   quotaLimits?: QuotaLimits;
   /** v0.12 售后政策（时效与自动批准门槛）。业务参数，运营可调 */
   returnPolicy?: ReturnPolicy;
+  /** v0.14 指标注册表。注入便于测试断言；缺省时内部新建 */
+  metrics?: MetricsRegistry;
 }
 
 const CHAT_BODY_SCHEMA = {
@@ -122,6 +126,11 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   const flows = new FlowEngine(stores.flows, [buildReturnFlow(basePolicy)]);
   setFlowEngine(flows);
   const confirmations = new ConfirmationService(stores.confirmations);
+
+  // v0.14：指标挂在 EventBus 上，AgentLoop 一行不改 ——
+  // 这是 v0.4 把事件分发收敛到总线换来的第三次红利
+  const metricsRegistry = opts.metrics ?? new MetricsRegistry();
+  const metrics = buildMetrics(metricsRegistry);
 
   // v0.13：租户配置带进程内缓存。配置读多写极少，每请求查库是纯浪费；
   // 不设 TTL、只在写入时失效 —— 「改了配置要等几分钟生效」不该需要向运营解释
@@ -246,6 +255,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     }
 
     const bus = new EventBus();
+    collectFrom(bus, metrics, Date.now());
     const tracker = new TokenTracker();
     const tenantId = session.getTenantId() || ANONYMOUS_TENANT;
     const loop = new AgentLoop({
@@ -262,7 +272,10 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         tenantId: session.getTenantId(),
         onIntent: hooks.onIntent,
         onRouted: hooks.onRouted,
-        onSafety: hooks.onSafety,
+        onSafety: (entry) => {
+          metrics.safetyActions.inc({ stage: entry.stage, action: entry.action });
+          hooks.onSafety?.(entry);
+        },
         onQuotaExceeded: hooks.onQuotaExceeded,
         resolved,
       }),
@@ -303,7 +316,6 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
           SafetyScanner.forOutput(),
           config.safetyLag ?? DEFAULT_SAFETY_LAG
         ),
-      scorer: new ResponseScorer(),
       // v0.12：高风险工具从「一律拒绝」改为「生成确认单」。
       //
       // v0.6 写死 `async () => false`，理由是服务端没有交互式确认通道 ——
@@ -318,15 +330,20 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
           summary: summarizeToolCall(toolName, input),
         });
 
-        if (outcome.decision === 'approved') return { approved: true };
+        if (outcome.decision === 'approved') {
+          metrics.confirmations.inc({ outcome: 'approved' });
+          return { approved: true };
+        }
 
         if (outcome.decision === 'rejected') {
+          metrics.confirmations.inc({ outcome: 'rejected' });
           return {
             approved: false,
             message: `客户已拒绝该操作（确认单 ${outcome.confirmation.id}）。请勿执行，并询问客户还需要什么帮助。`,
           };
         }
 
+        metrics.confirmations.inc({ outcome: 'required' });
         hooks.onConfirmationRequired?.(outcome.confirmation);
         return {
           approved: false,
@@ -773,6 +790,35 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         tools: a.toolNames.length > 0 ? a.toolNames : '*',
       })),
     })
+  );
+
+  // ============ 指标与安全报表（v0.14） ============
+
+  app.get('/metrics', async (_request, reply) => {
+    // Prometheus 规定的 content-type，版本号不能省 —— 少了它某些抓取端会拒绝
+    return reply
+      .header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8')
+      .send(metricsRegistry.render());
+  });
+
+  app.get<{ Params: { id: string } }>(
+    '/v1/sessions/:id/safety-report',
+    async (request, reply) => {
+      const session = await Session.restore(stores.sessions, request.params.id);
+      if (!session) {
+        return reply
+          .status(404)
+          .send(errorBody('session_not_found', `会话 ${request.params.id} 不存在`));
+      }
+
+      const report = buildSafetyReport(readSafetyAudit(session), 1);
+      return reply.send({
+        session_id: request.params.id,
+        // 口径写进响应体，避免调用方把「拦截构成」当成「误杀率」
+        note: '本报表统计拦截构成；真实误杀率需人工标注，此处提供筛查线索',
+        ...report,
+      });
+    }
   );
 
   // ============ 健康检查 ============

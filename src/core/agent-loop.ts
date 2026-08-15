@@ -4,7 +4,6 @@ import { Session } from './session.js';
 import { Pipeline, type TurnContext } from './pipeline.js';
 import { EventBus } from './event-bus.js';
 import type { ToolRegistry } from '../tools/tool-registry.js';
-import type { ResponseScorer } from '../evaluation/response-scorer.js';
 import type { TrajectoryLogger } from '../evaluation/trajectory-logger.js';
 import type { StreamingRedactor } from '../safety/streaming-redactor.js';
 import type {
@@ -73,7 +72,6 @@ export interface AgentLoopDeps {
   /** 直接注入总线（v0.6 SSE 适配器用）；缺省时内部新建 */
   bus?: EventBus;
   onConfirm?: ConfirmHandler;
-  scorer?: ResponseScorer;
   trajectory?: TrajectoryLogger;
   /**
    * v0.10：流式脱敏器工厂。**每次模型调用新建一个** —— 脱敏器持有缓冲区状态，
@@ -100,7 +98,6 @@ export class AgentLoop {
   private readonly pipeline: Pipeline;
   private readonly bus: EventBus;
   private readonly onConfirm: ConfirmHandler;
-  private readonly scorer?: ResponseScorer;
   private readonly redactorFactory?: () => StreamingRedactor;
   private readonly onUsage?: (record: CostRecord) => void | Promise<void>;
   private conversationMessages: Message[] = [];
@@ -114,7 +111,6 @@ export class AgentLoop {
     this.tracker = deps.tracker ?? new TokenTracker();
     this.pipeline = deps.pipeline ?? new Pipeline([]);
     this.onConfirm = deps.onConfirm ?? (async () => true);
-    this.scorer = deps.scorer;
     this.redactorFactory = deps.redactor;
     this.onUsage = deps.onUsage;
 
@@ -334,7 +330,15 @@ export class AgentLoop {
     // 阶段 3：并发执行（Promise.all 按输入顺序返回，天然保序）
     const results = await Promise.all(
       plans.map(async (plan): Promise<ToolResult> => {
-        if (plan.error) return plan.error;
+        if (plan.error) {
+          // 未进入执行也要发事件 —— 否则被拦下的调用在指标与 SSE 里完全隐形
+          this.emit({
+            type: 'tool_rejected',
+            toolName: plan.toolUse.name,
+            reason: plan.error.content,
+          });
+          return plan.error;
+        }
 
         const tool = plan.tool!;
         this.emit({
@@ -411,10 +415,12 @@ export class AgentLoop {
     this.conversationMessages.push(assistantMessage);
     await this.session.appendMessage(assistantMessage);
 
-    if (this.scorer) {
-      const score = this.scorer.score(ctx.userInput, reply, toolsUsed);
-      await this.session.appendMetadata('score', score);
-    }
+    // v0.14 删除了 ResponseScorer 的写入。
+    //
+    // 它从 v0.1 起每轮往 session 写一个 `score`，算法是「回复超过 50 字 +0.2、
+    // 调了工具 +0.3、提到『订单』+0.2」—— 测不出质量（越啰嗦分越高），
+    // 而且**十三个版本里没有任何代码读过它**。
+    // 真正的质量度量是离线评测集（scripts/eval.ts），不是每轮写一个假数。
     if (post.rewrittenBy.length > 0) {
       await this.session.appendMetadata('rewrittenBy', post.rewrittenBy);
     }

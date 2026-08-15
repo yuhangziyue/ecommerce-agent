@@ -145,6 +145,14 @@ export type AgentEvent =
    * 不必从 tool_end 里挑。
    */
   | { type: 'artifact'; toolName: string; artifact: ToolArtifact }
+  /**
+   * 工具调用**未进入执行**（v0.14）：工具不存在 / 参数不合法 / 高风险未通过确认。
+   *
+   * v0.14 之前这三种情况一个事件都不发 —— 模型收到一段文字，
+   * 而 SSE 消费方与指标完全看不见。于是「工具调用总数」这个指标是**偏低**的，
+   * 且偏低的正是最该被关注的那部分（被拦下的调用）。
+   */
+  | { type: 'tool_rejected'; toolName: string; reason: string }
   | { type: 'response'; content: string }
   | { type: 'error'; error: string }
   /** 被中间件拦截（注入检测 / 预算熔断 / 后续版本的合规与配额）；by 为中间件名 */
