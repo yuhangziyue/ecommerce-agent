@@ -38,8 +38,13 @@ export interface ToolUse {
 
 // Session
 export interface SessionEntry {
-  type: 'message' | 'tool_call' | 'tool_result' | 'metadata';
-  data: Message | ToolCallEntry | ToolResultEntry | MetadataEntry;
+  /**
+   * `summary` 是 v0.7 新增的中期记忆：被滑窗挤出去的历史被压成一条摘要。
+   * 它必须**落 session**（而不是只在内存里压）—— 否则 restore 出来的会话没有摘要，
+   * 下一个请求会重新压一次：多花一次模型调用，且两次摘要可能不一致。
+   */
+  type: 'message' | 'tool_call' | 'tool_result' | 'metadata' | 'summary';
+  data: Message | ToolCallEntry | ToolResultEntry | MetadataEntry | SummaryEntry;
   timestamp: number;
 }
 
@@ -58,6 +63,13 @@ export interface ToolResultEntry {
 export interface MetadataEntry {
   key: string;
   value: unknown;
+}
+
+export interface SummaryEntry {
+  /** 摘要正文 */
+  content: string;
+  /** 被压缩掉的原始消息条数，用于审计「这条摘要顶替了多少内容」 */
+  compactedCount: number;
 }
 
 // Token tracking
