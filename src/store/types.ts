@@ -83,6 +83,8 @@ export interface RefundStore {
 // ============ 用户画像（v0.7 长期记忆） ============
 
 export interface UserProfile {
+  /** v1.1：画像的身份是**(租户, 用户)** 而不是用户 —— 见 ProfileStore 的说明 */
+  tenantId: string;
   userId: string;
   displayName: string | null;
   /** 结构化偏好：收货时间、称呼、发票抬头等 */
@@ -92,14 +94,26 @@ export interface UserProfile {
   updatedAt: number;
 }
 
+/**
+ * 长期记忆存储。
+ *
+ * **每个方法的第一个参数都是租户，这是 v1.1 的核心修正。**
+ * v0.7~v1.0 期间画像按 `user_id` 单列存储，而 `user_id` 在真实接入中通常是
+ * 手机号或会员号 —— 可枚举。任何租户拿一个手机号就能读到另一个租户客户的
+ * 称呼、收货偏好、历史投诉备注。
+ *
+ * 把租户放在**第一个参数**而不是塞进 patch 里，是为了让漏传变成编译错误
+ * 而不是运行时的静默串户。
+ */
 export interface ProfileStore {
-  get(userId: string): Promise<UserProfile | null>;
+  get(tenantId: string, userId: string): Promise<UserProfile | null>;
   /** 局部更新：只覆盖传入的字段，preferences 做浅合并 */
   upsert(
+    tenantId: string,
     userId: string,
     patch: { displayName?: string; preferences?: Record<string, unknown> }
   ): Promise<UserProfile>;
-  addNote(userId: string, note: string): Promise<UserProfile>;
+  addNote(tenantId: string, userId: string, note: string): Promise<UserProfile>;
 }
 
 // ============ 计费账本（v0.11） ============

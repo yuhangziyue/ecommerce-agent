@@ -12,7 +12,8 @@
     "bench:stream": "tsx scripts/bench-streaming.ts",
     "bench:quota": "tsx scripts/bench-quota.ts",
     "eval": "tsx scripts/eval.ts",
-    "serve:tools": "tsx src/tool-server.ts"
+    "serve:tools": "tsx src/tool-server.ts",
+    "key:issue": "tsx scripts/issue-key.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

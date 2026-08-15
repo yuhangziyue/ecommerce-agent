@@ -31,6 +31,8 @@ export async function makeTestStores(db: Database): Promise<Stores> {
   const { PgFlowStore } = await import('../../src/store/pg-flow-store.js');
   const { PgConfirmationStore } = await import('../../src/store/pg-confirmation-store.js');
   const { PgTenantConfigStore } = await import('../../src/store/pg-tenant-config-store.js');
+  const { PgApiKeyStore } = await import('../../src/store/pg-api-key-store.js');
+  const { PgIdempotencyStore } = await import('../../src/store/pg-idempotency-store.js');
   const { NoOpSessionCache } = await import('../../src/store/session-cache.js');
 
   const cache = new NoOpSessionCache();
@@ -43,6 +45,9 @@ export async function makeTestStores(db: Database): Promise<Stores> {
     flows: new PgFlowStore(db),
     confirmations: new PgConfirmationStore(db),
     tenantConfigs: new PgTenantConfigStore(db),
+    // 测试库签出的钥匙用 ak_test_ 前缀 —— 不该长得像生产的
+    apiKeys: new PgApiKeyStore(db, 'test'),
+    idempotency: new PgIdempotencyStore(db),
     cache,
     close: async () => {},
   };

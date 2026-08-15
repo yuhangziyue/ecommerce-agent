@@ -11,11 +11,19 @@ import { installGracefulShutdown } from './server/shutdown.js';
  */
 async function main(): Promise<void> {
   const stores = await openStores(process.env.DATABASE_URL, process.env.REDIS_URL);
-  const app = await buildToolService({ stores, logger: true });
+  // 不设 token 时保持开放并在启动时警告 —— 与主服务 AGENT_AUTH_DISABLED 同一个口径
+  const app = await buildToolService({
+    stores,
+    logger: true,
+    authToken: process.env.TOOL_SERVICE_TOKEN,
+  });
 
   const port = Number(process.env.TOOL_SERVICE_PORT ?? 3101);
   await app.listen({ port, host: '0.0.0.0' });
   console.log(`工具服务已启动: http://localhost:${port}`);
+  console.log(
+    `  认证: ${process.env.TOOL_SERVICE_TOKEN ? '共享密钥已启用' : '⚠️  开放（设 TOOL_SERVICE_TOKEN 启用）'}`
+  );
 
   installGracefulShutdown({
     app,

@@ -5,6 +5,7 @@ import type { AgentConfig } from './core/types.js';
 import { parseSafetyLag } from './server/config.js';
 import { installGracefulShutdown } from './server/shutdown.js';
 import { RemoteToolGateway, FetchTransport } from './tools/remote-gateway.js';
+import { AUTH_DISABLED_WARNING } from './server/auth.js';
 
 /**
  * HTTP 服务入口（`npm run serve`）。
@@ -34,14 +35,31 @@ async function main(): Promise<void> {
 
   // v1.0：设了 TOOL_SERVICE_URL 就把工具执行交给独立的 tool-service，
   // 不设则单进程运行（行为与 v0.14 完全一致）
+  // v1.1：认证**默认开启**。关掉必须显式设环境变量，而且要吵得让人看见 ——
+  // 一个悄悄关着认证的生产实例，比一个明显没做认证的服务危险得多
+  const authDisabled = process.env.AGENT_AUTH_DISABLED === '1';
+  if (authDisabled) console.warn(AUTH_DISABLED_WARNING);
+
+  const rateLimitRps = Number(process.env.AGENT_RATE_LIMIT_RPS ?? 20);
+
   const toolServiceUrl = process.env.TOOL_SERVICE_URL;
   const app = await buildApp({
     stores,
     config,
     logger: true,
+    auth: { disabled: authDisabled },
+    rateLimit: {
+      rps: rateLimitRps,
+      redisUrl: process.env.REDIS_URL,
+      enabled: rateLimitRps > 0,
+    },
     toolGateway: toolServiceUrl
       ? new RemoteToolGateway(
-          new FetchTransport(toolServiceUrl, Number(process.env.TOOL_TIMEOUT_MS ?? 10_000))
+          new FetchTransport(
+            toolServiceUrl,
+            Number(process.env.TOOL_TIMEOUT_MS ?? 10_000),
+            process.env.TOOL_SERVICE_TOKEN
+          )
         )
       : undefined,
   });
@@ -67,13 +85,22 @@ async function main(): Promise<void> {
   console.log(
     `  工具执行: ${toolServiceUrl ? `远程 ${toolServiceUrl}（熔断+重试已启用）` : '本进程（设 TOOL_SERVICE_URL 可拆分）'}`
   );
+  console.log(
+    `  认证:     ${authDisabled ? '⚠️  已关闭（AGENT_AUTH_DISABLED=1）' : '已启用（Bearer API Key）'}`
+  );
+  console.log(
+    `  限流:     ${rateLimitRps > 0 ? `${rateLimitRps} rps/凭证${process.env.REDIS_URL ? '（Redis 全局）' : '（进程内 —— 多实例下是 N 倍）'}` : '未启用'}`
+  );
   console.log('');
   console.log('  POST /v1/chat            → SSE 流式');
   console.log('  POST /v1/chat/sync       → JSON 一次性');
   console.log('  GET  /v1/sessions/:id    → 会话元信息');
   console.log('  GET  /v1/sessions/:id/messages');
   console.log('  GET  /v1/users/:id/profile');
-  console.log('  GET  /healthz');
+  console.log('  POST /v1/confirmations/:id');
+  console.log('  GET  /healthz  ·  GET /metrics   → 免认证');
+  console.log('');
+  console.log('  签发凭证: npm run key:issue -- --tenant <租户号> --scopes chat,read');
   console.log('================================================\n');
 }
 

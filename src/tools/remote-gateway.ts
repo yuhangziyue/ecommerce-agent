@@ -24,7 +24,9 @@ export interface HttpTransport {
 export class FetchTransport implements HttpTransport {
   constructor(
     private readonly baseUrl: string,
-    private readonly timeoutMs = 10_000
+    private readonly timeoutMs = 10_000,
+    /** v1.1 工具服务的共享密钥（`TOOL_SERVICE_TOKEN`）。不设则不带 */
+    private readonly authToken?: string
   ) {}
 
   async request(input: {
@@ -38,7 +40,11 @@ export class FetchTransport implements HttpTransport {
     try {
       const res = await fetch(`${this.baseUrl}${input.path}`, {
         method: input.method,
-        headers: { 'Content-Type': 'application/json', ...(input.headers ?? {}) },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(this.authToken ? { authorization: `Bearer ${this.authToken}` } : {}),
+          ...(input.headers ?? {}),
+        },
         body: input.body === undefined ? undefined : JSON.stringify(input.body),
         signal: controller.signal,
       });

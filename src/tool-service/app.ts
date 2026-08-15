@@ -6,6 +6,7 @@ import { FlowEngine } from '../flows/engine.js';
 import { buildReturnFlow, DEFAULT_RETURN_POLICY } from '../flows/return-flow.js';
 import { MetricsRegistry } from '../observability/metrics.js';
 import type { Stores } from '../store/index.js';
+import { safeEqual, parseBearer } from '../auth/api-key.js';
 import type { ToolContext } from '../core/types.js';
 
 /**
@@ -19,7 +20,17 @@ export interface ToolServiceOptions {
   stores: Stores;
   logger?: boolean;
   metrics?: MetricsRegistry;
+  /**
+   * v1.1 共享密钥。不设则**开放**（内网部署的默认假设），但启动时会警告。
+   *
+   * 刻意不用主服务那套 API Key：工具服务的调用方只有编排层一个，
+   * 没有多租户、没有 scope —— 引入一整套密钥体系是过度设计。
+   */
+  authToken?: string;
 }
+
+export const TOOL_SERVICE_OPEN_WARNING =
+  '[tool-service] ⚠️  未设置 TOOL_SERVICE_TOKEN —— 任何能连到本端口的人都可以直接执行退款等高风险工具，且不经过主服务的确认流。仅限可信内网。';
 
 const EXECUTE_SCHEMA = {
   type: 'object',
@@ -47,6 +58,26 @@ export async function buildToolService(
   const app = Fastify({
     logger: opts.logger ?? false,
     ajv: { customOptions: { removeAdditional: false } },
+  });
+
+  // v1.1：主服务的高风险确认流（v0.12）挡在**编排层**。
+  // 绕过编排层直接打这个端点，那道确认流根本不存在 ——
+  // 所以这里必须有自己的门，哪怕只是一把共享钥匙
+  if (!opts.authToken) console.warn(TOOL_SERVICE_OPEN_WARNING);
+
+  app.addHook('onRequest', async (request, reply) => {
+    if (!opts.authToken) return;
+    if (request.routeOptions?.url === '/healthz' || request.url === '/healthz') return;
+    if (request.routeOptions?.url === '/metrics' || request.url === '/metrics') return;
+
+    const presented = parseBearer(request.headers.authorization);
+    // 定长比较：凭证比较不做时序防护是不需要每次重新论证的默认动作
+    if (!presented || !safeEqual(presented, opts.authToken)) {
+      return reply
+        .status(401)
+        .header('WWW-Authenticate', 'Bearer realm="tool-service"')
+        .send({ error: { code: 'unauthorized', message: '凭证无效或缺失' } });
+    }
   });
 
   const registry = buildToolRegistry();

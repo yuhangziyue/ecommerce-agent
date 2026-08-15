@@ -10,6 +10,7 @@ import { MetricsRegistry } from '../../src/observability/metrics.js';
 import { buildMetrics, collectFrom } from '../../src/observability/collector.js';
 import { EventBus } from '../../src/core/event-bus.js';
 import { openTestDb, truncateAll, makeTestStores } from '../store/helpers.js';
+import { seedKeyOn, type TestKey } from '../server/helpers.js';
 import type { Database } from '../../src/store/types.js';
 import type {
   AgentConfig,
@@ -18,6 +19,15 @@ import type {
   ChatResponse,
 } from '../../src/core/types.js';
 import type { ToolDescriptor } from '../../src/tools/gateway.js';
+
+/**
+ * v1.1：所有端点都要凭证。这里签一把**带 admin 的**测试钥匙 ——
+ * 本文件测的不是认证，用 admin 是为了让既有用例里 body 带 tenant_id 的写法继续成立
+ *（代客操作，见 SPEC P16d）。认证与租户隔离本身由
+ * `tests/server/auth.test.ts` 与 `tests/server/isolation.test.ts` 专门覆盖。
+ */
+let H: TestKey['headers'];
+
 
 describe('CircuitBreaker · 三态转换', () => {
   let clock = 0;
@@ -321,6 +331,7 @@ describe('取消传播（还 v0.6 的账）', () => {
 
   beforeAll(async () => {
     db = await openTestDb();
+    H = (await seedKeyOn(db, { tenantId: 't_test', scopes: ['chat', 'read', 'write', 'admin'] })).headers;
   });
   afterAll(async () => db.close());
   beforeEach(async () => truncateAll(db));
@@ -379,7 +390,7 @@ describe('取消传播（还 v0.6 的账）', () => {
     const provider = new AbortAwareProvider();
     const app = await buildApp({ stores: await makeTestStores(db), config, provider });
 
-    await app.inject({ method: 'POST', url: '/v1/chat', payload: { message: '你好' } });
+    await app.inject({ headers: H, method: 'POST', url: '/v1/chat', payload: { message: '你好' } });
     expect(provider.sawSignal).toBe(true);
     await app.close();
   });
@@ -406,7 +417,7 @@ describe('取消传播（还 v0.6 的账）', () => {
     const provider = new AbortAwareProvider();
     const app = await buildApp({ stores: await makeTestStores(db), config, provider });
 
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat/sync',
       payload: { message: '你好' },
@@ -422,6 +433,7 @@ describe('优雅退出 · draining', () => {
 
   beforeAll(async () => {
     db = await openTestDb();
+    H = (await seedKeyOn(db, { tenantId: 't_test', scopes: ['chat', 'read', 'write', 'admin'] })).headers;
   });
   afterAll(async () => db.close());
   beforeEach(async () => truncateAll(db));
@@ -455,7 +467,7 @@ describe('优雅退出 · draining', () => {
       config,
       provider: new Simple(),
     });
-    const res = await app.inject({ method: 'GET', url: '/healthz' });
+    const res = await app.inject({ headers: H, method: 'GET', url: '/healthz' });
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).status).toBe('ok');
     await app.close();
@@ -470,12 +482,12 @@ describe('优雅退出 · draining', () => {
 
     app.startDraining();
 
-    const health = await app.inject({ method: 'GET', url: '/healthz' });
+    const health = await app.inject({ headers: H, method: 'GET', url: '/healthz' });
     expect(health.statusCode).toBe(503);
     expect(JSON.parse(health.body).status).toBe('draining');
 
     // 关键：不接新流量 ≠ 立刻停机。这两件事差着所有在途请求的成败
-    const chat = await app.inject({
+    const chat = await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat/sync',
       payload: { message: '你好' },
@@ -492,7 +504,7 @@ describe('优雅退出 · draining', () => {
       config,
       provider: new Simple(),
     });
-    const body = JSON.parse((await app.inject({ method: 'GET', url: '/healthz' })).body);
+    const body = JSON.parse((await app.inject({ headers: H, method: 'GET', url: '/healthz' })).body);
     expect(body.tool_gateway).toBe('local');
     await app.close();
   });

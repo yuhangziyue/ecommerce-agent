@@ -6,6 +6,7 @@ import { buildToolRegistry } from '../../src/tools/index.js';
 import { setRefundStore } from '../../src/tools/refund-store.js';
 import { MetricsRegistry } from '../../src/observability/metrics.js';
 import { openTestDb, truncateAll, makeTestStores } from '../store/helpers.js';
+import { seedKeyOn, type TestKey } from '../server/helpers.js';
 import type { Database } from '../../src/store/types.js';
 import type { Stores } from '../../src/store/index.js';
 import type {
@@ -15,6 +16,15 @@ import type {
 } from '../../src/core/types.js';
 import type { ToolDescriptor, ToolGateway } from '../../src/tools/gateway.js';
 import type { FastifyInstance } from 'fastify';
+
+/**
+ * v1.1：所有端点都要凭证。这里签一把**带 admin 的**测试钥匙 ——
+ * 本文件测的不是认证，用 admin 是为了让既有用例里 body 带 tenant_id 的写法继续成立
+ *（代客操作，见 SPEC P16d）。认证与租户隔离本身由
+ * `tests/server/auth.test.ts` 与 `tests/server/isolation.test.ts` 专门覆盖。
+ */
+let H: TestKey['headers'];
+
 
 const usage = { inputTokens: 100, outputTokens: 20 };
 
@@ -80,6 +90,7 @@ describe('🔴 同一套用例跑两种网关，结果必须一致（拆分不�
 
   beforeAll(async () => {
     db = await openTestDb();
+    H = (await seedKeyOn(db, { tenantId: 't_test', scopes: ['chat', 'read', 'write', 'admin'] })).headers;
   });
   afterAll(async () => db.close());
   beforeEach(async () => {
@@ -110,7 +121,7 @@ describe('🔴 同一套用例跑两种网关，结果必须一致（拆分不�
           provider,
           toolGateway: make(),
         });
-        const res = await app.inject({
+        const res = await app.inject({ headers: H,
           method: 'POST',
           url: '/v1/chat/sync',
           payload: { message: msg, user_id: 'u_1', tenant_id: 't_1' },
@@ -177,6 +188,7 @@ describe('工具服务 · 独立端点的自我保护', () => {
 
   beforeAll(async () => {
     db = await openTestDb();
+    H = (await seedKeyOn(db, { tenantId: 't_test', scopes: ['chat', 'read', 'write', 'admin'] })).headers;
   });
   afterAll(async () => db.close());
   beforeEach(async () => {
@@ -372,5 +384,92 @@ describe('🔴 远程故障的错误语义（基础设施故障 ≠ 业务结论
     await gw.execute('order_lookup', { orderId: 'X' }, ctx);
     expect(seen!['x-trace-id']).toBe('tr_x');
     expect(seen!['x-span-id']).toMatch(/^sp_/);
+  });
+});
+
+// ============ v1.1：工具服务的共享密钥 ============
+//
+// v0.15 拆出这个服务时没给它任何认证。主服务上退款要过高风险确认流（v0.12），
+// **绕过主服务直接打工具服务，那道确认流根本不存在** ——
+// 拆分形态恰恰是要上规模时才用的形态，这个洞不能留。
+
+describe('工具服务 · 共享密钥认证', () => {
+  let db: Database;
+  let stores: Stores;
+  let svc: FastifyInstance;
+  const TOKEN = 'tk_shared_secret';
+
+  beforeAll(async () => {
+    db = await openTestDb();
+  });
+  afterAll(async () => db.close());
+  beforeEach(async () => {
+    await truncateAll(db);
+    stores = await makeTestStores(db);
+    svc = await buildToolService({ stores, authToken: TOKEN });
+  });
+  afterEach(async () => svc.close());
+
+  const exec = (headers?: Record<string, string>) =>
+    svc.inject({
+      method: 'POST',
+      url: '/v1/tools/execute',
+      headers,
+      payload: {
+        name: 'refund_apply',
+        input: { orderId: 'ORD-20260801-001', reason: '质量问题' },
+      },
+    });
+
+  it('🔴 无密钥直接执行退款 → 401，退款单一条都没落', async () => {
+    const res = await exec();
+    expect(res.statusCode).toBe(401);
+
+    const { rows } = await db.query('SELECT * FROM refund_tickets');
+    expect(rows).toHaveLength(0);
+  });
+
+  it('🔴 错误的密钥 → 401', async () => {
+    const res = await exec({ authorization: 'Bearer 猜一个' });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('正确的密钥 → 放行', async () => {
+    const res = await exec({ authorization: `Bearer ${TOKEN}` });
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('🔴 探针免认证（LB 与抓取端没有密钥）', async () => {
+    expect((await svc.inject({ method: 'GET', url: '/healthz' })).statusCode).toBe(200);
+    expect((await svc.inject({ method: 'GET', url: '/metrics' })).statusCode).toBe(200);
+  });
+
+  it('🔴 网关自动带上密钥 —— 拆分形态端到端仍然通', async () => {
+    const gateway = new RemoteToolGateway({
+      async request({ method, path, headers, body }) {
+        // FetchTransport 会把 authorization 塞进 headers；这里用 inject 模拟真实转发
+        const res = await svc.inject({
+          method,
+          url: path,
+          headers: { authorization: `Bearer ${TOKEN}`, ...headers },
+          payload: body as any,
+        });
+        return { status: res.statusCode, body: res.body };
+      },
+    });
+
+    const tools = await gateway.list();
+    expect(tools.length).toBeGreaterThan(0);
+  });
+
+  it('不设密钥时保持开放（内网部署的默认假设）', async () => {
+    const open = await buildToolService({ stores });
+    const res = await open.inject({
+      method: 'POST',
+      url: '/v1/tools/execute',
+      payload: { name: 'order_lookup', input: { orderId: 'ORD-20260801-001' } },
+    });
+    expect(res.statusCode).toBe(200);
+    await open.close();
   });
 });

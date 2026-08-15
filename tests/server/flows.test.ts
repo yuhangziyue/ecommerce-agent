@@ -1,5 +1,6 @@
 import { buildApp } from '../../src/server/app.js';
 import { openTestDb, truncateAll, makeTestStores } from '../store/helpers.js';
+import { seedKeyOn, type TestKey } from './helpers.js';
 import { judgeLogistics } from '../../src/tools/logistics-check.js';
 import { loadOrders } from '../../src/data/loader.js';
 import type { Database } from '../../src/store/types.js';
@@ -11,6 +12,15 @@ import type {
   ChatResponse,
 } from '../../src/core/types.js';
 import type { FastifyInstance } from 'fastify';
+
+/**
+ * v1.1：所有端点都要凭证。这里签一把**带 admin 的**测试钥匙 ——
+ * 本文件测的不是认证，用 admin 是为了让既有用例里 body 带 tenant_id 的写法继续成立
+ *（代客操作，见 SPEC P16d）。认证与租户隔离本身由
+ * `tests/server/auth.test.ts` 与 `tests/server/isolation.test.ts` 专门覆盖。
+ */
+let H: TestKey['headers'];
+
 
 const usage = { inputTokens: 10, outputTokens: 5 };
 
@@ -70,6 +80,7 @@ describe('退货退款流 · 端到端', () => {
 
   beforeAll(async () => {
     db = await openTestDb();
+    H = (await seedKeyOn(db, { tenantId: 't_test', scopes: ['chat', 'read', 'write', 'admin'] })).headers;
   });
   afterAll(async () => db.close());
   beforeEach(async () => {
@@ -84,7 +95,7 @@ describe('退货退款流 · 端到端', () => {
     app = await buildApp({ stores, config, provider, returnPolicy: policy });
 
     const first = JSON.parse(
-      (await app.inject({
+      (await app.inject({ headers: H,
         method: 'POST',
         url: '/v1/chat/sync',
         payload: { message: '我要退货' },
@@ -92,19 +103,19 @@ describe('退货退款流 · 端到端', () => {
     );
 
     const list = JSON.parse(
-      (await app.inject({
+      (await app.inject({ headers: H,
         method: 'GET',
         url: `/v1/sessions/${first.session_id}/confirmations`,
       })).body
     ).confirmations;
 
-    await app.inject({
+    await app.inject({ headers: H,
       method: 'POST',
       url: `/v1/confirmations/${list[0].confirmation_id}`,
       payload: { approved: true },
     });
 
-    await app.inject({
+    await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat/sync',
       payload: { message: '已确认', session_id: first.session_id },
@@ -170,7 +181,7 @@ describe('退货退款流 · 端到端', () => {
     );
     expect(rows).toHaveLength(1);
 
-    const res = await app.inject({ method: 'GET', url: `/v1/flows/${rows[0].id}` });
+    const res = await app.inject({ headers: H, method: 'GET', url: `/v1/flows/${rows[0].id}` });
     expect(res.statusCode).toBe(200);
 
     const body = JSON.parse(res.body);
@@ -189,7 +200,7 @@ describe('退货退款流 · 端到端', () => {
   it('不存在的流程 → 404', async () => {
     provider = new ToolProvider('order_lookup', { orderId: 'x' });
     app = await buildApp({ stores, config, provider });
-    const res = await app.inject({ method: 'GET', url: '/v1/flows/flow_nope' });
+    const res = await app.inject({ headers: H, method: 'GET', url: '/v1/flows/flow_nope' });
     expect(res.statusCode).toBe(404);
   });
 
@@ -209,7 +220,7 @@ describe('退货退款流 · 端到端', () => {
       [orderId]
     );
     const body = JSON.parse(
-      (await app.inject({ method: 'GET', url: `/v1/flows/${rows[0].id}` })).body
+      (await app.inject({ headers: H, method: 'GET', url: `/v1/flows/${rows[0].id}` })).body
     );
     expect(body.state).toBe('approved');
   });

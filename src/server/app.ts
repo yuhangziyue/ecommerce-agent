@@ -1,4 +1,9 @@
-import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
+import Fastify, {
+  type FastifyError,
+  type FastifyInstance,
+  type FastifyReply,
+  type FastifyRequest,
+} from 'fastify';
 import { AgentLoop } from '../core/agent-loop.js';
 import { ModelProvider } from '../core/model-provider.js';
 import { EventBus } from '../core/event-bus.js';
@@ -46,6 +51,27 @@ import { AgentRegistry } from '../agents/registry.js';
 import type { DomainAgent } from '../agents/types.js';
 import type { IntentState } from '../intent/types.js';
 import { Pipeline } from '../core/pipeline.js';
+import {
+  createAuthHook,
+  canAccessTenant,
+  notFound,
+  principalOf,
+  requireScope,
+} from './auth.js';
+import {
+  createRateLimiter,
+  NoOpRateLimiter,
+  type RateLimiter,
+  type RateLimitOptions,
+} from './rate-limit.js';
+import {
+  readIdempotencyKey,
+  withIdempotency,
+  DEFAULT_IDEMPOTENCY_TTL_MS,
+  type IdempotentOutcome,
+} from './idempotency.js';
+import { requestFingerprint } from '../auth/api-key.js';
+import type { Principal } from '../auth/types.js';
 import type { Stores } from '../store/index.js';
 import type { AgentConfig, AgentEvent, ChatProvider } from '../core/types.js';
 
@@ -69,6 +95,17 @@ export interface AppOptions {
    * 传 `RemoteToolGateway` 则工具在独立的 tool-service 里执行。
    */
   toolGateway?: ToolGateway;
+  /**
+   * v1.1 认证。**默认开启** —— 关掉要显式传 `disabled: true`
+   * （生产由 `AGENT_AUTH_DISABLED=1` 驱动，且启动时打警告）。
+   * 延续 v1.0 `isRetryable` 缺省不重试的同一条原则：默认值站在出错时损失最小的一侧。
+   */
+  auth?: { disabled?: boolean };
+  /** v1.1 限流。缺省按 `AGENT_RATE_LIMIT_RPS` 装配；传 `rateLimiter` 可注入假实现 */
+  rateLimit?: RateLimitOptions & { redisUrl?: string; enabled?: boolean };
+  rateLimiter?: RateLimiter;
+  /** v1.1 幂等键有效期，缺省 24 小时 */
+  idempotencyTtlMs?: number;
 }
 
 const CHAT_BODY_SCHEMA = {
@@ -108,6 +145,42 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       },
     },
   });
+
+  // ============ v1.1 身份、限流、幂等 ============
+  //
+  // 三件事挂在最前面是刻意的：**未认证的请求不该走到请求体解析**，
+  // 更不该消耗任何下游资源（v0.10 已经为「安全中间件必须最先」论证过同一件事）。
+  app.addHook('onRequest', createAuthHook({ keys: stores.apiKeys, disabled: opts.auth?.disabled }));
+
+  const rateLimiter =
+    opts.rateLimiter ??
+    (opts.rateLimit
+      ? await createRateLimiter(opts.rateLimit)
+      : new NoOpRateLimiter());
+
+  app.addHook('onRequest', async (request, reply) => {
+    // 没有 principal = 免认证路径（/metrics、/healthz）。
+    // 探针被限流会让实例在高负载时被误判为不健康 —— 那正是雪崩的开始
+    const principal = request.principal;
+    if (!principal) return;
+
+    // **按 principal 限而不是按 IP**：网关/LB 后面所有请求的 IP 都是同一个，
+    // 按 IP 限流要么全放要么全封
+    const verdict = await rateLimiter.consume(principal.keyId);
+    if (!verdict.allowed) {
+      return reply
+        .status(429)
+        .header('Retry-After', Math.ceil(verdict.retryAfterMs / 1000).toString())
+        .send({
+          error: {
+            code: 'rate_limited',
+            message: `请求过于频繁，请 ${Math.ceil(verdict.retryAfterMs / 1000)} 秒后重试`,
+          },
+        });
+    }
+  });
+
+  app.addHook('onClose', async () => rateLimiter.close());
 
   // 工具注册表与退款 store 是进程级的，装配一次。
   // v0.15：远程模式下这两样都不需要 —— 工具在 tool-service 里执行，
@@ -160,6 +233,44 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     };
   }
 
+  // ============ v1.1 归属校验 ============
+  //
+  // **跨租户访问一律按「不存在」处理**。403 等于确认「这个 id 存在，只是不属于你」——
+  // 那就是一个存在性探测接口，拿它可以枚举出竞争对手有多少会话、多少退款单。
+  //
+  // 项目里已有同款先例并写明了理由：`/v1/tenants/:id/usage` 对不存在的租户返回全零
+  // 而不是 404。这一版把它变成全局规则。
+
+  /** 载入一个**属于调用方**的会话；不存在或不属于他，都返回 404 */
+  async function loadOwnedSession(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    sessionId: string
+  ): Promise<Session | null> {
+    const session = await Session.restore(stores.sessions, sessionId);
+    if (!session || !canAccessTenant(principalOf(request), session.getTenantId())) {
+      notFound(reply, 'session_not_found', `会话 ${sessionId} 不存在`);
+      return null;
+    }
+    return session;
+  }
+
+  /**
+   * 校验路径里的租户号是不是调用方自己的。
+   *
+   * `admin` 可跨租户（运营后台）。非 admin 访问别人的租户 —— 同样按不存在处理。
+   */
+  function ownsTenantParam(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    tenantId: string,
+    code: string
+  ): boolean {
+    if (canAccessTenant(principalOf(request), tenantId)) return true;
+    notFound(reply, code, `租户 ${tenantId} 不存在`);
+    return false;
+  }
+
   /** 在默认管道上挂两个记忆中间件（顺序约束由 buildDefaultPipeline 内部保证） */
   function buildMemoryPipeline(o: {
     tracker: TokenTracker;
@@ -190,7 +301,12 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         onExceeded: o.onQuotaExceeded,
       },
       enrich: [
-        createProfileMiddleware({ profiles: stores.profiles, userId: o.userId }),
+        createProfileMiddleware({
+          profiles: stores.profiles,
+          // v1.1：画像按 (租户, 用户) 读。在此之前一个手机号在所有租户之间共享画像
+          tenantId: o.tenantId ?? ANONYMOUS_TENANT,
+          userId: o.userId,
+        }),
         createIntentMiddleware({
           recognizer,
           session: o.session,
@@ -210,6 +326,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
    */
   async function prepareTurn(
     body: ChatBody,
+    principal: Principal,
     traceId: string,
     signal: AbortSignal | undefined,
     hooks: {
@@ -223,11 +340,32 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     | { ok: true; session: Session; loop: AgentLoop; bus: EventBus; tracker: TokenTracker }
     | { ok: false; status: number; code: string; message: string }
   > {
+    // ── v1.1 租户绑定 ──
+    //
+    // body 里的 `tenant_id` 从「数据来源」降级为「断言」：不一致直接 403，
+    // **不是静默覆盖** —— 静默覆盖会让调用方以为自己写的生效了。
+    // 这一条是整个 v1.1 的核心：在此之前，改一个 JSON 字段就能烧别人的额度。
+    //
+    // 唯一的例外是 `admin`：运营后台代客操作是真实需求，而 admin 本来就是
+    // 「跨租户」这件事的显式载体。走 `canAccessTenant` 统一判定，
+    // 不为它开第二条分支 —— 两处判定迟早会不一致。
+    const boundTenant = body.tenant_id ?? principal.tenantId;
+    if (!canAccessTenant(principal, boundTenant)) {
+      return {
+        ok: false,
+        status: 403,
+        code: 'tenant_mismatch',
+        message: `凭证属于租户 ${principal.tenantId}，不能以租户 ${body.tenant_id} 的身份调用`,
+      };
+    }
+
     let session: Session | null;
     if (body.session_id) {
       session = await Session.restore(stores.sessions, body.session_id);
-      if (!session) {
-        // 不静默新建 —— 否则「会话丢失」会表现为「模型突然失忆」，极难排查
+      // 不静默新建 —— 否则「会话丢失」会表现为「模型突然失忆」，极难排查。
+      // 别人的会话与不存在的会话**返回同一个 404**：能借别人的会话发消息，
+      // 等于既能读到他的历史，又能把账记到他头上
+      if (!session || !canAccessTenant(principal, session.getTenantId())) {
         return {
           ok: false,
           status: 404,
@@ -238,7 +376,9 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     } else {
       session = await Session.create(stores.sessions, {
         userId: body.user_id,
-        tenantId: body.tenant_id,
+        // **凭证说了算**。这是本版最重要的一行 ——
+        // 非 admin 的 boundTenant 必然等于 principal.tenantId（上面已经拦过）
+        tenantId: boundTenant,
       });
     }
 
@@ -377,12 +517,15 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     '/v1/chat',
     { schema: { body: CHAT_BODY_SCHEMA } },
     async (request, reply) => {
+      const principal = requireScope(request, reply, 'chat');
+      if (!principal) return reply;
+
       let writer: SseWriter | undefined;
       const traceId = (request.headers['x-trace-id'] as string) || newTraceId();
       // v1.0：客户端断开 → 中断本轮。v0.6 只停止写出，模型继续跑完 ——
       // 那不是浪费 CPU，是在给一个已经没人看的回答付钱
       const controller = new AbortController();
-      const prepared = await prepareTurn(request.body, traceId, controller.signal, {
+      const prepared = await prepareTurn(request.body, principal, traceId, controller.signal, {
         onIntent: (state) =>
           writer?.writeIntent({
             intent: state.intent,
@@ -420,6 +563,39 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
 
       const { session, loop, bus } = prepared;
 
+      // ── 幂等（SSE 版）──
+      //
+      // **刻意不重放流**：流里有 `confirmation_required` 这类当时才成立的事件，
+      // 重放一条旧流会让客户端弹出一个早已被决策过的确认框。
+      // 改为返回 409 + session_id —— **指路比伪造一条流诚实**。
+      const idemKey = readIdempotencyKey(request.headers as Record<string, unknown>);
+      if (idemKey) {
+        const claim = await stores.idempotency.claim({
+          key: idemKey,
+          keyId: principal.keyId,
+          endpoint: 'POST /v1/chat',
+          requestHash: requestFingerprint(request.body),
+          ttlMs: opts.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS,
+          now: Date.now(),
+        });
+        if (!claim.claimed) {
+          const e = claim.existing;
+          const code =
+            e.requestHash !== requestFingerprint(request.body)
+              ? 'idempotency_key_reused'
+              : e.status === 'in_progress'
+                ? 'request_in_progress'
+                : 'already_completed';
+          return reply.status(409).send({
+            error: {
+              code,
+              message: `幂等键 ${idemKey} 已被使用（${code}）`,
+              ...(e.responseBody as Record<string, unknown> | null),
+            },
+          });
+        }
+      }
+
       reply.raw.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-transform',
@@ -441,7 +617,19 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
 
       try {
         await loop.run(request.body.message);
+        if (idemKey) {
+          // 存的是**指路信息**而不是流：重复请求会拿到 409 + 这个 session_id，
+          // 调用方据此去 /v1/sessions/:id/messages 取结果
+          await stores.idempotency.complete({
+            key: idemKey,
+            keyId: principal.keyId,
+            responseStatus: 409,
+            responseBody: { session_id: session.getId(), trace_id: traceId },
+          });
+        }
       } catch (err) {
+        // 失败释放占位 —— 失败往往是瞬时的，该让调用方能真的重来一次
+        if (idemKey) await stores.idempotency.release(idemKey, principal.keyId).catch(() => {});
         writer.writeError('internal_error', (err as Error).message);
       } finally {
         writer.close();
@@ -458,56 +646,95 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     '/v1/chat/sync',
     { schema: { body: CHAT_BODY_SCHEMA } },
     async (request, reply) => {
+      const principal = requireScope(request, reply, 'chat');
+      if (!principal) return reply;
+
       const traceId = (request.headers['x-trace-id'] as string) || newTraceId();
-      const prepared = await prepareTurn(request.body, traceId, undefined);
-      if (!prepared.ok) {
-        return reply
-          .status(prepared.status)
-          .send(errorBody(prepared.code, prepared.message));
-      }
 
-      const { session, loop, bus, tracker } = prepared;
-      const blocked: { by: string; reason: string }[] = [];
-      // v0.13：非流式调用方也要能拿到结构化数据，否则只能去解析 reply 里的中文
-      const artifacts: Array<{ tool: string; artifact: ToolArtifact }> = [];
-      bus.subscribe((event) => {
-        if (event.type === 'blocked') blocked.push({ by: event.by, reason: event.reason });
-        if (event.type === 'artifact') {
-          artifacts.push({ tool: event.toolName, artifact: event.artifact });
-        }
-      });
+      // 非流式端点是**响应可以被完整存下来重放**的那一类，所以走完整的幂等语义。
+      // 这一层挡的是最贵的一种重复：客户端超时重发 → 退款被执行两次。
+      // v0.3/v0.12/v1.0 三版都在防重复执行，但入口敞着的时候那三道防线一道都不生效
+      const outcome = await withIdempotency(
+        stores.idempotency,
+        principal,
+        readIdempotencyKey(request.headers as Record<string, unknown>),
+        'POST /v1/chat/sync',
+        request.body,
+        async (): Promise<IdempotentOutcome> => {
+          const prepared = await prepareTurn(request.body, principal, traceId, undefined);
+          if (!prepared.ok) {
+            return {
+              status: prepared.status,
+              body: errorBody(prepared.code, prepared.message),
+            };
+          }
 
-      const reply_text = await loop.run(request.body.message);
-      const summary = tracker.getSummary();
+          const { session, loop, bus, tracker } = prepared;
+          const blocked: { by: string; reason: string }[] = [];
+          // v0.13：非流式调用方也要能拿到结构化数据，否则只能去解析 reply 里的中文
+          const artifacts: Array<{ tool: string; artifact: ToolArtifact }> = [];
+          let upstreamError: string | null = null;
+          bus.subscribe((event) => {
+            if (event.type === 'blocked') blocked.push({ by: event.by, reason: event.reason });
+            if (event.type === 'artifact') {
+              artifacts.push({ tool: event.toolName, artifact: event.artifact });
+            }
+            if (event.type === 'error') upstreamError = event.error;
+          });
 
-      return reply.header('X-Trace-Id', traceId).send({
-        session_id: session.getId(),
-        trace_id: traceId,
-        reply: reply_text,
-        artifacts: artifacts.map((a) => ({
-          tool: a.tool,
-          type: a.artifact.type,
-          data: a.artifact.data,
-        })),
-        blocked: blocked.length > 0 ? blocked : undefined,
-        usage: {
-          input_tokens: summary.totalInputTokens,
-          output_tokens: summary.totalOutputTokens,
-          cost_usd: Number(summary.totalCostUsd.toFixed(6)),
+          const reply_text = await loop.run(request.body.message);
+          const summary = tracker.getSummary();
+
+          // v1.1：模型调用失败时 AgentLoop 会把 `LLM调用失败: xxx` 当作**正常回复正文**
+          // 返回（agent-loop.ts:247）。回 200 有两层后果：接入方把这句话当成客服的
+          // 回答展示给客户；而幂等键会把这个"成功响应"存 24 小时 ——
+          // 一次几秒的抖动被固化成一天。5xx 让既有的「不落幂等记录」规则接管
+          if (upstreamError) {
+            return {
+              status: 502,
+              body: errorBody('upstream_error', upstreamError),
+            };
+          }
+
+          return {
+            status: 200,
+            body: {
+              session_id: session.getId(),
+              trace_id: traceId,
+              reply: reply_text,
+              artifacts: artifacts.map((a) => ({
+                tool: a.tool,
+                type: a.artifact.type,
+                data: a.artifact.data,
+              })),
+              blocked: blocked.length > 0 ? blocked : undefined,
+              usage: {
+                input_tokens: summary.totalInputTokens,
+                output_tokens: summary.totalOutputTokens,
+                cost_usd: Number(summary.totalCostUsd.toFixed(6)),
+              },
+            },
+          };
         },
-      });
+        { ttlMs: opts.idempotencyTtlMs }
+      );
+
+      return reply
+        .status(outcome.status)
+        .header('X-Trace-Id', traceId)
+        // 让调用方能分辨「这次真的执行了」和「这是上次的结果」——
+        // 不告诉他的话，重放会被当成一次新的成功执行
+        .header('Idempotent-Replay', outcome.replayed ? 'true' : 'false')
+        .send(outcome.body);
     }
   );
 
   // ============ 会话查询 ============
 
   app.get<{ Params: { id: string } }>('/v1/sessions/:id', async (request, reply) => {
-    const session = await Session.restore(stores.sessions, request.params.id);
-    if (!session) {
-      return reply
-        .status(404)
-        .send(errorBody('session_not_found', `会话 ${request.params.id} 不存在`));
-    }
+    if (!requireScope(request, reply, 'read')) return reply;
+    const session = await loadOwnedSession(request, reply, request.params.id);
+    if (!session) return reply;
     return reply.send({
       session_id: session.getId(),
       user_id: session.getUserId(),
@@ -520,12 +747,9 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   app.get<{ Params: { id: string } }>(
     '/v1/sessions/:id/messages',
     async (request, reply) => {
-      const session = await Session.restore(stores.sessions, request.params.id);
-      if (!session) {
-        return reply
-          .status(404)
-          .send(errorBody('session_not_found', `会话 ${request.params.id} 不存在`));
-      }
+      if (!requireScope(request, reply, 'read')) return reply;
+      const session = await loadOwnedSession(request, reply, request.params.id);
+      if (!session) return reply;
       return reply.send({
         session_id: session.getId(),
         messages: session.getMessages().map((m) => ({
@@ -541,7 +765,13 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   // ============ 用户画像（v0.7 长期记忆） ============
 
   app.get<{ Params: { id: string } }>('/v1/users/:id/profile', async (request, reply) => {
-    const profile = await stores.profiles.get(request.params.id);
+    const principal = requireScope(request, reply, 'read');
+    if (!principal) return reply;
+
+    // v1.1：画像按 (租户, 用户) 读。在此之前主键是 user_id 单列 ——
+    // 而 user_id 在真实接入中通常是手机号，**可枚举**：
+    // 任何租户拿一个手机号就能读到别家客户的称呼、收货偏好、投诉备注
+    const profile = await stores.profiles.get(principal.tenantId, request.params.id);
     if (!profile) {
       return reply
         .status(404)
@@ -572,48 +802,88 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     '/v1/confirmations/:id',
     { schema: { body: DECIDE_SCHEMA } },
     async (request, reply) => {
+      const principal = requireScope(request, reply, 'write');
+      if (!principal) return reply;
+
       const existing = await confirmations.get(request.params.id);
-      if (!existing) {
-        return reply
-          .status(404)
-          .send(errorBody('confirmation_not_found', `确认单 ${request.params.id} 不存在`));
+      // 确认单没有租户列 —— 归属的唯一真相在它所属的 session 上。
+      // **决策别人的退款是本版拦下的最贵的一件事**：在此之前，
+      // 猜到一个确认单 id 就能批准别家客户的退款申请
+      const owner = existing
+        ? await Session.restore(stores.sessions, existing.sessionId)
+        : null;
+      if (!existing || !owner || !canAccessTenant(principal, owner.getTenantId())) {
+        return notFound(
+          reply,
+          'confirmation_not_found',
+          `确认单 ${request.params.id} 不存在`
+        );
       }
 
-      const decided = await confirmations.decide(
-        request.params.id,
-        request.body.approved,
-        request.body.decided_by ?? 'customer'
+      // v1.1：幂等键包住整个决策。
+      //
+      // v0.12 让第二次决策返回 409「已处理过」，那对**真的重复决策**是对的；
+      // 但调用方网络超时重发时，他并没有做错任何事，却拿到一个错误 ——
+      // 于是运营界面显示「审批失败」，而后台其实已经批了。
+      // 幂等键正好把这两种情形分开：带键的是重发，不带键的是重复决策。
+      const outcome = await withIdempotency(
+        stores.idempotency,
+        principal,
+        readIdempotencyKey(request.headers as Record<string, unknown>),
+        `POST /v1/confirmations/${request.params.id}`,
+        request.body,
+        async (): Promise<IdempotentOutcome> => {
+          const decided = await confirmations.decide(
+            request.params.id,
+            request.body.approved,
+            request.body.decided_by ?? 'customer'
+          );
+
+          // decide 返回 null = 已经被决策过。**409 而不是 200** ——
+          // 静默接受第二次决策会让「谁批的」变成一笔糊涂账
+          if (!decided) {
+            return {
+              status: 409,
+              body: errorBody(
+                'confirmation_already_decided',
+                `确认单 ${request.params.id} 已处理过（当前状态 ${existing.status}），不能重复决策`
+              ),
+            };
+          }
+
+          return {
+            status: 200,
+            body: {
+              confirmation_id: decided.id,
+              status: decided.status,
+              decided_by: decided.decidedBy,
+              summary: decided.summary,
+              // 明确告诉调用方还要再发一轮，操作才会真正执行
+              next:
+                decided.status === 'approved'
+                  ? '请再发一轮对话（如「已确认」），操作将自动执行'
+                  : null,
+            },
+          };
+        },
+        { ttlMs: opts.idempotencyTtlMs }
       );
 
-      // decide 返回 null = 已经被决策过。**409 而不是 200** ——
-      // 静默接受第二次决策会让「谁批的」变成一笔糊涂账
-      if (!decided) {
-        return reply
-          .status(409)
-          .send(
-            errorBody(
-              'confirmation_already_decided',
-              `确认单 ${request.params.id} 已处理过（当前状态 ${existing.status}），不能重复决策`
-            )
-          );
-      }
-
-      return reply.send({
-        confirmation_id: decided.id,
-        status: decided.status,
-        decided_by: decided.decidedBy,
-        summary: decided.summary,
-        // 明确告诉调用方还要再发一轮，操作才会真正执行
-        next: decided.status === 'approved'
-          ? '请再发一轮对话（如「已确认」），操作将自动执行'
-          : null,
-      });
+      return reply
+        .status(outcome.status)
+        .header('Idempotent-Replay', outcome.replayed ? 'true' : 'false')
+        .send(outcome.body);
     }
   );
 
   app.get<{ Params: { id: string } }>(
     '/v1/sessions/:id/confirmations',
     async (request, reply) => {
+      if (!requireScope(request, reply, 'read')) return reply;
+      // 确认单本身没有租户列 —— 归属的唯一真相在 session 上。
+      // 多一次查询，换的是不引入第二处租户来源（两处迟早会不一致）
+      if (!(await loadOwnedSession(request, reply, request.params.id))) return reply;
+
       const list = await confirmations.listBySession(request.params.id, 50);
       return reply.send({
         session_id: request.params.id,
@@ -630,11 +900,15 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   );
 
   app.get<{ Params: { id: string } }>('/v1/flows/:id', async (request, reply) => {
+    const principal = requireScope(request, reply, 'read');
+    if (!principal) return reply;
+
     const flow = await flows.get(request.params.id);
-    if (!flow) {
-      return reply
-        .status(404)
-        .send(errorBody('flow_not_found', `流程 ${request.params.id} 不存在`));
+    // 同确认单：流程的租户归属在 session 上。退货流程里有订单号、金额、理由 ——
+    // 全是别家的经营数据
+    const owner = flow ? await Session.restore(stores.sessions, flow.sessionId) : null;
+    if (!flow || !owner || !canAccessTenant(principal, owner.getTenantId())) {
+      return notFound(reply, 'flow_not_found', `流程 ${request.params.id} 不存在`);
     }
 
     const history = await flows.history(flow.id);
@@ -668,12 +942,9 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   app.get<{ Params: { id: string } }>(
     '/v1/sessions/:id/artifacts',
     async (request, reply) => {
-      const session = await Session.restore(stores.sessions, request.params.id);
-      if (!session) {
-        return reply
-          .status(404)
-          .send(errorBody('session_not_found', `会话 ${request.params.id} 不存在`));
-      }
+      if (!requireScope(request, reply, 'read')) return reply;
+      const session = await loadOwnedSession(request, reply, request.params.id);
+      if (!session) return reply;
 
       const artifacts = session
         .getEntries()
@@ -720,6 +991,12 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     '/v1/tenants/:id/config',
     { schema: { body: TENANT_CONFIG_SCHEMA } },
     async (request, reply) => {
+      if (!requireScope(request, reply, 'write')) return reply;
+      // 改别人的配额上限 / 售后政策 —— 按不存在处理
+      if (!ownsTenantParam(request, reply, request.params.id, 'tenant_not_found')) {
+        return reply;
+      }
+
       // 安全规则刻意**不通过这个接口配置** —— HTTP 传正则再服务端 new RegExp，
       // 等于开了一个 ReDoS 入口。规则变更走部署，不走运行时 API
       const saved = await tenantConfigs.upsert({
@@ -738,6 +1015,11 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   );
 
   app.get<{ Params: { id: string } }>('/v1/tenants/:id/config', async (request, reply) => {
+    if (!requireScope(request, reply, 'read')) return reply;
+    if (!ownsTenantParam(request, reply, request.params.id, 'tenant_not_found')) {
+      return reply;
+    }
+
     const cfg = await tenantConfigs.get(request.params.id);
     const resolved = await resolveForTenant(request.params.id);
     return reply.send({
@@ -758,6 +1040,12 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   app.get<{ Params: { id: string }; Querystring: { since?: string; limit?: string } }>(
     '/v1/tenants/:id/usage',
     async (request, reply) => {
+      if (!requireScope(request, reply, 'read')) return reply;
+      // 用量 = 账单。看别家的账单既是商业机密泄露，也是竞争情报
+      if (!ownsTenantParam(request, reply, request.params.id, 'tenant_not_found')) {
+        return reply;
+      }
+
       const since = request.query.since ? Number(request.query.since) : undefined;
       if (since !== undefined && !Number.isFinite(since)) {
         return reply
@@ -803,8 +1091,9 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
 
   // ============ 领域 Agent 列表（v0.9） ============
 
-  app.get('/v1/agents', async (_request, reply) =>
-    reply.send({
+  app.get('/v1/agents', async (request, reply) => {
+    if (!requireScope(request, reply, 'read')) return reply;
+    return reply.send({
       agents: agents.getAll().map((a) => ({
         id: a.id,
         name: a.name,
@@ -812,8 +1101,8 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         intents: a.intents,
         tools: a.toolNames.length > 0 ? a.toolNames : '*',
       })),
-    })
-  );
+    });
+  });
 
   // ============ 指标与安全报表（v0.14） ============
 
@@ -827,12 +1116,9 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   app.get<{ Params: { id: string } }>(
     '/v1/sessions/:id/safety-report',
     async (request, reply) => {
-      const session = await Session.restore(stores.sessions, request.params.id);
-      if (!session) {
-        return reply
-          .status(404)
-          .send(errorBody('session_not_found', `会话 ${request.params.id} 不存在`));
-      }
+      if (!requireScope(request, reply, 'read')) return reply;
+      const session = await loadOwnedSession(request, reply, request.params.id);
+      if (!session) return reply;
 
       const report = buildSafetyReport(readSafetyAudit(session), 1);
       return reply.send({
@@ -872,6 +1158,10 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         engine: stores.db.engine,
         cache: stores.cache.kind,
         tool_gateway: opts.toolGateway ? 'remote' : 'local',
+        auth: opts.auth?.disabled ? 'disabled' : 'enabled',
+        // **进程内限流在多实例下是 N 倍配额**。这个事实必须暴露给运维 ——
+        // 「限流失准」这件事，运维不知道就等于没有限流
+        rate_limit: rateLimiter.kind,
       });
     } catch (err) {
       return reply

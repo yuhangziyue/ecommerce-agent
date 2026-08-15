@@ -1,6 +1,7 @@
 import type { Database, ProfileStore, UserProfile } from './types.js';
 
 interface ProfileRow {
+  tenant_id: string;
   user_id: string;
   display_name: string | null;
   preferences: Record<string, unknown>;
@@ -10,6 +11,7 @@ interface ProfileRow {
 
 function toProfile(row: ProfileRow): UserProfile {
   return {
+    tenantId: row.tenant_id,
     userId: row.user_id,
     displayName: row.display_name,
     preferences: row.preferences ?? {},
@@ -21,21 +23,25 @@ function toProfile(row: ProfileRow): UserProfile {
   };
 }
 
-const COLUMNS = 'user_id, display_name, preferences, notes, updated_at';
+const COLUMNS = 'tenant_id, user_id, display_name, preferences, notes, updated_at';
 
 /**
  * 长期记忆：跨会话的用户画像。
  *
  * 与短期滑窗、中期摘要的区别在于**生命周期**：它不属于任何一次会话，
  * 客户明天再来时称呼、收货偏好、历史投诉都还在。
+ *
+ * **v1.1：全部读写按 `(tenant_id, user_id)`。**
+ * 在此之前主键是 `user_id` 单列 —— 那意味着"张先生偏好晚上收货、曾投诉物流"
+ * 这类 PII 在所有租户之间是共享的，而 user_id 通常就是手机号。
  */
 export class PgProfileStore implements ProfileStore {
   constructor(private readonly db: Database) {}
 
-  async get(userId: string): Promise<UserProfile | null> {
+  async get(tenantId: string, userId: string): Promise<UserProfile | null> {
     const { rows } = await this.db.query<ProfileRow>(
-      `SELECT ${COLUMNS} FROM user_profiles WHERE user_id = $1`,
-      [userId]
+      `SELECT ${COLUMNS} FROM user_profiles WHERE tenant_id = $1 AND user_id = $2`,
+      [tenantId, userId]
     );
     return rows[0] ? toProfile(rows[0]) : null;
   }
@@ -45,31 +51,32 @@ export class PgProfileStore implements ProfileStore {
    * 调用方通常只知道自己关心的那几个字段，整体覆盖会把别人写的偏好抹掉。
    */
   async upsert(
+    tenantId: string,
     userId: string,
     patch: { displayName?: string; preferences?: Record<string, unknown> }
   ): Promise<UserProfile> {
     const { rows } = await this.db.query<ProfileRow>(
-      `INSERT INTO user_profiles (user_id, display_name, preferences)
-       VALUES ($1, $2, $3::jsonb)
-       ON CONFLICT (user_id) DO UPDATE SET
+      `INSERT INTO user_profiles (tenant_id, user_id, display_name, preferences)
+       VALUES ($1, $2, $3, $4::jsonb)
+       ON CONFLICT (tenant_id, user_id) DO UPDATE SET
          display_name = COALESCE(EXCLUDED.display_name, user_profiles.display_name),
          preferences  = user_profiles.preferences || EXCLUDED.preferences,
          updated_at   = now()
        RETURNING ${COLUMNS}`,
-      [userId, patch.displayName ?? null, JSON.stringify(patch.preferences ?? {})]
+      [tenantId, userId, patch.displayName ?? null, JSON.stringify(patch.preferences ?? {})]
     );
     return toProfile(rows[0]);
   }
 
-  async addNote(userId: string, note: string): Promise<UserProfile> {
+  async addNote(tenantId: string, userId: string, note: string): Promise<UserProfile> {
     const { rows } = await this.db.query<ProfileRow>(
-      `INSERT INTO user_profiles (user_id, notes)
-       VALUES ($1, $2::jsonb)
-       ON CONFLICT (user_id) DO UPDATE SET
-         notes      = user_profiles.notes || $2::jsonb,
+      `INSERT INTO user_profiles (tenant_id, user_id, notes)
+       VALUES ($1, $2, $3::jsonb)
+       ON CONFLICT (tenant_id, user_id) DO UPDATE SET
+         notes      = user_profiles.notes || $3::jsonb,
          updated_at = now()
        RETURNING ${COLUMNS}`,
-      [userId, JSON.stringify([note])]
+      [tenantId, userId, JSON.stringify([note])]
     );
     return toProfile(rows[0]);
   }

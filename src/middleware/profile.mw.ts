@@ -14,6 +14,11 @@ import type { ProfileStore } from '../store/types.js';
 export function createProfileMiddleware(opts: {
   profiles: ProfileStore;
   userId?: string | null;
+  /**
+   * v1.1：画像按 (租户, 用户) 存。**不传等于不注入**而不是"按全局查" ——
+   * 后者正是 v0.7~v1.0 的洞：一个手机号在所有租户之间共享画像。
+   */
+  tenantId: string;
 }): AgentMiddleware {
   return {
     name: 'profile',
@@ -21,7 +26,7 @@ export function createProfileMiddleware(opts: {
       if (!opts.userId) return { action: 'continue' };
 
       try {
-        const profile = await opts.profiles.get(opts.userId);
+        const profile = await opts.profiles.get(opts.tenantId, opts.userId);
         const context = renderProfileContext(profile);
         if (context) ctx.systemAppends.push(context);
       } catch (err) {

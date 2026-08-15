@@ -1,5 +1,6 @@
 import { buildApp } from '../../src/server/app.js';
 import { openTestDb, truncateAll, makeTestStores } from '../store/helpers.js';
+import { seedKeyOn, type TestKey } from './helpers.js';
 import type { Database } from '../../src/store/types.js';
 import type { Stores } from '../../src/store/index.js';
 import type {
@@ -9,6 +10,15 @@ import type {
   ChatResponse,
 } from '../../src/core/types.js';
 import type { FastifyInstance } from 'fastify';
+
+/**
+ * v1.1：所有端点都要凭证。这里签一把**带 admin 的**测试钥匙 ——
+ * 本文件测的不是认证，用 admin 是为了让既有用例里 body 带 tenant_id 的写法继续成立
+ *（代客操作，见 SPEC P16d）。认证与租户隔离本身由
+ * `tests/server/auth.test.ts` 与 `tests/server/isolation.test.ts` 专门覆盖。
+ */
+let H: TestKey['headers'];
+
 
 const usage = { inputTokens: 10, outputTokens: 5 };
 
@@ -80,6 +90,7 @@ describe('异步确认 · v0.6 那个「用户取消了该操作」的谎话', (
 
   beforeAll(async () => {
     db = await openTestDb();
+    H = (await seedKeyOn(db, { tenantId: 't_test', scopes: ['chat', 'read', 'write', 'admin'] })).headers;
   });
   afterAll(async () => db.close());
 
@@ -92,7 +103,7 @@ describe('异步确认 · v0.6 那个「用户取消了该操作」的谎话', (
   afterEach(async () => app.close());
 
   const chat = async (message: string, sessionId?: string) => {
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat/sync',
       payload: sessionId ? { message, session_id: sessionId } : { message },
@@ -112,7 +123,7 @@ describe('异步确认 · v0.6 那个「用户取消了该操作」的谎话', (
   it('🔴 确认单落库且带可核对的摘要（客户点同意时只会读这个）', async () => {
     const { session_id } = await chat('我要退款');
 
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'GET',
       url: `/v1/sessions/${session_id}/confirmations`,
     });
@@ -128,13 +139,13 @@ describe('异步确认 · v0.6 那个「用户取消了该操作」的谎话', (
     const first = await chat('我要退款');
 
     const list = JSON.parse(
-      (await app.inject({
+      (await app.inject({ headers: H,
         method: 'GET',
         url: `/v1/sessions/${first.session_id}/confirmations`,
       })).body
     ).confirmations;
 
-    const decide = await app.inject({
+    const decide = await app.inject({ headers: H,
       method: 'POST',
       url: `/v1/confirmations/${list[0].confirmation_id}`,
       payload: { approved: true, decided_by: 'customer' },
@@ -157,13 +168,13 @@ describe('异步确认 · v0.6 那个「用户取消了该操作」的谎话', (
   it('🔴 客户拒绝后不执行，且模型被告知是「客户拒绝」不是别的', async () => {
     const first = await chat('我要退款');
     const list = JSON.parse(
-      (await app.inject({
+      (await app.inject({ headers: H,
         method: 'GET',
         url: `/v1/sessions/${first.session_id}/confirmations`,
       })).body
     ).confirmations;
 
-    await app.inject({
+    await app.inject({ headers: H,
       method: 'POST',
       url: `/v1/confirmations/${list[0].confirmation_id}`,
       payload: { approved: false },
@@ -180,13 +191,13 @@ describe('异步确认 · v0.6 那个「用户取消了该操作」的谎话', (
   it('🔴 确认单不可重放（批准一次不能换两次退款）', async () => {
     const first = await chat('我要退款');
     const list = JSON.parse(
-      (await app.inject({
+      (await app.inject({ headers: H,
         method: 'GET',
         url: `/v1/sessions/${first.session_id}/confirmations`,
       })).body
     ).confirmations;
 
-    await app.inject({
+    await app.inject({ headers: H,
       method: 'POST',
       url: `/v1/confirmations/${list[0].confirmation_id}`,
       payload: { approved: true },
@@ -205,19 +216,19 @@ describe('异步确认 · v0.6 那个「用户取消了该操作」的谎话', (
   it('🔴 重复决策返回 409（静默接受会让「谁批的」变成糊涂账）', async () => {
     const first = await chat('我要退款');
     const list = JSON.parse(
-      (await app.inject({
+      (await app.inject({ headers: H,
         method: 'GET',
         url: `/v1/sessions/${first.session_id}/confirmations`,
       })).body
     ).confirmations;
     const id = list[0].confirmation_id;
 
-    const a = await app.inject({
+    const a = await app.inject({ headers: H,
       method: 'POST',
       url: `/v1/confirmations/${id}`,
       payload: { approved: true, decided_by: '甲' },
     });
-    const b = await app.inject({
+    const b = await app.inject({ headers: H,
       method: 'POST',
       url: `/v1/confirmations/${id}`,
       payload: { approved: false, decided_by: '乙' },
@@ -229,7 +240,7 @@ describe('异步确认 · v0.6 那个「用户取消了该操作」的谎话', (
   });
 
   it('不存在的确认单 → 404', async () => {
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/confirmations/cfm_nope',
       payload: { approved: true },
@@ -238,7 +249,7 @@ describe('异步确认 · v0.6 那个「用户取消了该操作」的谎话', (
   });
 
   it('SSE 出现 confirmation_required 事件', async () => {
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat',
       payload: { message: '我要退款' },
@@ -257,7 +268,7 @@ describe('异步确认 · v0.6 那个「用户取消了该操作」的谎话', (
     await chat('真的要退', first.session_id);
 
     const list = JSON.parse(
-      (await app.inject({
+      (await app.inject({ headers: H,
         method: 'GET',
         url: `/v1/sessions/${first.session_id}/confirmations`,
       })).body
@@ -270,7 +281,7 @@ describe('异步确认 · v0.6 那个「用户取消了该操作」的谎话', (
     const lowRisk = new RefundProvider('order_lookup', { orderId: 'ORD-20260801-001' });
     const app2 = await buildApp({ stores, config, provider: lowRisk });
 
-    await app2.inject({
+    await app2.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat/sync',
       payload: { message: '查订单' },

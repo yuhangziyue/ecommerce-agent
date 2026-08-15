@@ -1,5 +1,6 @@
 import { buildApp } from '../../src/server/app.js';
 import { openTestDb, truncateAll, makeTestStores } from '../store/helpers.js';
+import { seedKeyOn, type TestKey } from './helpers.js';
 import { resolveSafetyRules, CachedTenantConfig } from '../../src/tenants/config.js';
 import { INPUT_RULES } from '../../src/safety/rules.js';
 import { PgTenantConfigStore } from '../../src/store/pg-tenant-config-store.js';
@@ -12,6 +13,15 @@ import type {
   ChatResponse,
 } from '../../src/core/types.js';
 import type { FastifyInstance } from 'fastify';
+
+/**
+ * v1.1：所有端点都要凭证。这里签一把**带 admin 的**测试钥匙 ——
+ * 本文件测的不是认证，用 admin 是为了让既有用例里 body 带 tenant_id 的写法继续成立
+ *（代客操作，见 SPEC P16d）。认证与租户隔离本身由
+ * `tests/server/auth.test.ts` 与 `tests/server/isolation.test.ts` 专门覆盖。
+ */
+let H: TestKey['headers'];
+
 
 const usage = { inputTokens: 10, outputTokens: 5 };
 
@@ -73,6 +83,7 @@ describe('结构化数据贯通到 API 表面', () => {
 
   beforeAll(async () => {
     db = await openTestDb();
+    H = (await seedKeyOn(db, { tenantId: 't_test', scopes: ['chat', 'read', 'write', 'admin'] })).headers;
   });
   afterAll(async () => db.close());
   beforeEach(async () => {
@@ -84,7 +95,7 @@ describe('结构化数据贯通到 API 表面', () => {
   afterEach(async () => app.close());
 
   it('🔴 /v1/chat/sync 返回 artifacts，调用方不必解析 reply 里的中文', async () => {
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat/sync',
       payload: { message: '有什么电子产品' },
@@ -100,7 +111,7 @@ describe('结构化数据贯通到 API 表面', () => {
   it('🔴 模型换个说法，artifact 一个字节都不变（这就是它不经过模型的意义）', async () => {
     provider.replyText = '为您找到以下商品';
     const a = JSON.parse(
-      (await app.inject({
+      (await app.inject({ headers: H,
         method: 'POST',
         url: '/v1/chat/sync',
         payload: { message: '有什么电子产品' },
@@ -109,7 +120,7 @@ describe('结构化数据贯通到 API 表面', () => {
 
     provider.replyText = '亲，这几款都不错哦～售价￥两百九十九起';
     const b = JSON.parse(
-      (await app.inject({
+      (await app.inject({ headers: H,
         method: 'POST',
         url: '/v1/chat/sync',
         payload: { message: '有什么电子产品' },
@@ -121,7 +132,7 @@ describe('结构化数据贯通到 API 表面', () => {
   });
 
   it('🔴 SSE 出现独立的 artifact 事件', async () => {
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat',
       payload: { message: '有什么电子产品' },
@@ -135,7 +146,7 @@ describe('结构化数据贯通到 API 表面', () => {
   });
 
   it('tool_end 上也挂一份，省得客户端订阅两个事件', async () => {
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat',
       payload: { message: '有什么电子产品' },
@@ -151,7 +162,7 @@ describe('结构化数据贯通到 API 表面', () => {
       config,
       provider: new ToolProvider('faq_search', { query: '退货' }),
     });
-    const res = await app2.inject({
+    const res = await app2.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat',
       payload: { message: '怎么退货' },
@@ -165,14 +176,14 @@ describe('结构化数据贯通到 API 表面', () => {
 
   it('🔴 /v1/sessions/:id/artifacts 可回放（断线重连不必重跑对话）', async () => {
     const { session_id } = JSON.parse(
-      (await app.inject({
+      (await app.inject({ headers: H,
         method: 'POST',
         url: '/v1/chat/sync',
         payload: { message: '有什么电子产品' },
       })).body
     );
 
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'GET',
       url: `/v1/sessions/${session_id}/artifacts`,
     });
@@ -185,7 +196,7 @@ describe('结构化数据贯通到 API 表面', () => {
   });
 
   it('回放不存在的会话 → 404', async () => {
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'GET',
       url: '/v1/sessions/sesn_nope/artifacts',
     });
@@ -199,7 +210,7 @@ describe('结构化数据贯通到 API 表面', () => {
       provider: new ToolProvider('faq_search', { query: '退货' }),
     });
     const { session_id } = JSON.parse(
-      (await app2.inject({
+      (await app2.inject({ headers: H,
         method: 'POST',
         url: '/v1/chat/sync',
         payload: { message: '怎么退货' },
@@ -207,7 +218,7 @@ describe('结构化数据贯通到 API 表面', () => {
     );
 
     const body = JSON.parse(
-      (await app2.inject({ method: 'GET', url: `/v1/sessions/${session_id}/artifacts` }))
+      (await app2.inject({ headers: H, method: 'GET', url: `/v1/sessions/${session_id}/artifacts` }))
         .body
     );
     expect(body.artifacts).toEqual([]);
@@ -222,6 +233,7 @@ describe('租户配置（还 v0.10 / v0.12 的账）', () => {
 
   beforeAll(async () => {
     db = await openTestDb();
+    H = (await seedKeyOn(db, { tenantId: 't_test', scopes: ['chat', 'read', 'write', 'admin'] })).headers;
   });
   afterAll(async () => db.close());
   beforeEach(async () => {
@@ -238,7 +250,7 @@ describe('租户配置（还 v0.10 / v0.12 的账）', () => {
 
   it('未配置租户时用默认值，行为与本版之前一致', async () => {
     const body = JSON.parse(
-      (await app.inject({ method: 'GET', url: '/v1/tenants/t_new/config' })).body
+      (await app.inject({ headers: H, method: 'GET', url: '/v1/tenants/t_new/config' })).body
     );
     expect(body.configured).toBe(false);
     expect(body.effective.quota_limits.perSession).toBe(100_000);
@@ -246,7 +258,7 @@ describe('租户配置（还 v0.10 / v0.12 的账）', () => {
   });
 
   it('🔴 租户可配自己的售后政策与配额', async () => {
-    await app.inject({
+    await app.inject({ headers: H,
       method: 'PUT',
       url: '/v1/tenants/t_vip/config',
       payload: {
@@ -256,7 +268,7 @@ describe('租户配置（还 v0.10 / v0.12 的账）', () => {
     });
 
     const body = JSON.parse(
-      (await app.inject({ method: 'GET', url: '/v1/tenants/t_vip/config' })).body
+      (await app.inject({ headers: H, method: 'GET', url: '/v1/tenants/t_vip/config' })).body
     );
     expect(body.configured).toBe(true);
     expect(body.effective.return_policy.windowDays).toBe(30);
@@ -266,38 +278,38 @@ describe('租户配置（还 v0.10 / v0.12 的账）', () => {
   });
 
   it('🔴 不同租户互不影响', async () => {
-    await app.inject({
+    await app.inject({ headers: H,
       method: 'PUT',
       url: '/v1/tenants/t_a/config',
       payload: { return_policy: { windowDays: 30 } },
     });
 
     const b = JSON.parse(
-      (await app.inject({ method: 'GET', url: '/v1/tenants/t_b/config' })).body
+      (await app.inject({ headers: H, method: 'GET', url: '/v1/tenants/t_b/config' })).body
     );
     expect(b.effective.return_policy.windowDays).toBe(7);
   });
 
   it('配置改完立即生效（缓存写入即失效，不需要等 TTL）', async () => {
-    await app.inject({
+    await app.inject({ headers: H,
       method: 'GET',
       url: '/v1/tenants/t_x/config',
     }); // 先读一次，把 null 塞进缓存
 
-    await app.inject({
+    await app.inject({ headers: H,
       method: 'PUT',
       url: '/v1/tenants/t_x/config',
       payload: { return_policy: { windowDays: 99 } },
     });
 
     const body = JSON.parse(
-      (await app.inject({ method: 'GET', url: '/v1/tenants/t_x/config' })).body
+      (await app.inject({ headers: H, method: 'GET', url: '/v1/tenants/t_x/config' })).body
     );
     expect(body.effective.return_policy.windowDays).toBe(99);
   });
 
   it('未知字段被拒（400），不静默丢弃', async () => {
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'PUT',
       url: '/v1/tenants/t_y/config',
       payload: { returnPolicy: { windowDays: 30 } }, // 驼峰，应该是 return_policy
@@ -355,6 +367,7 @@ describe('租户配置存储与缓存', () => {
 
   beforeAll(async () => {
     db = await openTestDb();
+    H = (await seedKeyOn(db, { tenantId: 't_test', scopes: ['chat', 'read', 'write', 'admin'] })).headers;
     store = new PgTenantConfigStore(db);
   });
   afterAll(async () => db.close());

@@ -2,11 +2,11 @@
 
 一个电商场景的对话式 AI 客服服务。**对外提供 HTTP/SSE 接口**，不是命令行玩具。
 
-从 v0.1 到 v1.0 走了 15 个版本，每版都有 SPEC / PLAN / REPORT 存档在
+从 v0.1 到 v1.1 走了 16 个版本，每版都有 SPEC / PLAN / REPORT 存档在
 [`docs/iterations/`](docs/iterations/)，总路线见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。
 
 ```
-645 个用例 ｜ npm run verify exit 0 ｜ 离线评测 15/15 ｜ 三维回归门守着质量·成本·延迟
+738 个用例 ｜ npm run verify exit 0 ｜ 离线评测 15/15 ｜ 三维回归门守着质量·成本·延迟
 ```
 
 ---
@@ -24,7 +24,9 @@
 | **业务流** | 退货退款状态机，守卫 + 审批分档 + 全程流转留痕 |
 | **异步确认** | 高风险操作生成确认单，客户确认后才执行；确认单一次性不可重放 |
 | **结构化返回** | 工具产出 artifact（商品卡/订单卡/优惠券方案…），**不经过模型** |
-| **多租户** | 账本、配额、售后政策、安全规则均可按租户配置（规则只能加严） |
+| **多租户** | 账本、配额、售后政策、安全规则、**用户画像**均按租户隔离（规则只能加严） |
+| **身份与边界** | API Key 认证（存哈希）+ scope + **租户只从凭证取** + 越权一律 404 |
+| **防滥用** | 按凭证限流（429 + Retry-After）+ `Idempotency-Key`（重发不会重复退款） |
 | **可观测** | Prometheus `/metrics` + 离线评测集 + 三维回归门 |
 | **韧性** | 熔断 + 重试（高风险工具永不重试）+ 取消传播 + 优雅退出 |
 | **可拆分** | 工具执行可作为独立服务，两种形态行为一致 |
@@ -35,9 +37,12 @@
 npm install
 export ANTHROPIC_API_KEY=sk-...
 
-npm run serve      # 启动服务（默认 3000）
-npm start          # 另开一个终端，CLI 瘦客户端
+npm run serve                                          # 启动服务（默认 3000）
+npm run key:issue -- --tenant t_demo --scopes chat,read # 签一把凭证
 ```
+
+**认证默认开启**。签发时明文只出现一次 —— 库里存的是 sha256 哈希，
+丢了只能重新签发。本地开发想跳过可设 `AGENT_AUTH_DISABLED=1`（启动会打警告）。
 
 **零配置即可跑**：不设 `DATABASE_URL` 时用 PGlite（PostgreSQL 编译成 WASM，跑在进程内），
 不设 `REDIS_URL` 时自动降级为无缓存。要切真实 PG/Redis 只改环境变量，业务代码一行不动。
@@ -57,12 +62,18 @@ npm run serve:tools  # 单独启动工具服务（拆分形态）
 ```bash
 # 流式对话
 curl -N -X POST localhost:3000/v1/chat \
+  -H 'Authorization: Bearer ak_live_...' \
   -H 'Content-Type: application/json' \
-  -d '{"message":"我的订单 ORD-20260801-001 到哪了","user_id":"u1","tenant_id":"t1"}'
+  -d '{"message":"我的订单 ORD-20260801-001 到哪了","user_id":"u1"}'
 
-# 非流式
-curl -X POST localhost:3000/v1/chat/sync -H 'Content-Type: application/json' \
+# 非流式 + 幂等键（超时重发不会重复执行）
+curl -X POST localhost:3000/v1/chat/sync \
+  -H 'Authorization: Bearer ak_live_...' \
+  -H 'Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000' \
+  -H 'Content-Type: application/json' \
   -d '{"message":"有什么电子产品"}'
+
+# 租户号**不从请求体取** —— 它是凭证的属性。传了且与凭证不符会 403
 ```
 
 SSE 事件：`session` / `intent` / `routing` / `safety` / `delta` / `thinking` /
@@ -77,7 +88,11 @@ SSE 事件：`session` / `intent` / `routing` / `safety` / `delta` / `thinking` 
 | `GET /v1/flows/:id` | 退货退款流程进度与流转记录 |
 | `GET` · `PUT /v1/tenants/:id/config` · `GET /v1/tenants/:id/usage` | 租户配置与用量 |
 | `GET /v1/users/:id/profile` | 用户画像（长期记忆） |
-| `GET /v1/agents` · `/metrics` · `/healthz` | 领域 Agent 列表、指标、健康检查 |
+| `GET /v1/agents` | 领域 Agent 列表 |
+| `GET /metrics` · `/healthz` | 指标、健康检查（**免认证**，不返回任何租户数据） |
+
+权限：`chat` 发起对话 · `read` 读 · `write` 决策确认单/改配置 · `admin` 跨租户（运营后台）。
+`admin` **不隐含**其余三者 —— 只做审计的管理端不该顺手能发起对话。
 
 ## 架构
 
@@ -120,6 +135,7 @@ SSE 事件：`session` / `intent` / `routing` / `safety` / `delta` / `thinking` 
 | `src/observability/` | 指标注册表与采集器 |
 | `src/evaluation/` | 评测用例、判定逻辑、回归门 |
 | `src/resilience/` | 熔断器与重试 |
+| `src/auth/` | Principal、API Key 生成与哈希 |
 | `src/tool-service/` | 独立工具服务 |
 
 ## 部署
@@ -155,6 +171,9 @@ SSE 事件：`session` / `intent` / `routing` / `safety` / `delta` / `thinking` 
 | v0.13 | 对外只有文本 API，接入方只能正则解析模型的中文散文 |
 | v0.14 | `ResponseScorer` 是假指标（越啰嗦分越高），且 13 个版本没人读过它 |
 | v0.15 | `tool.execute` 是函数引用 —— 工具与编排绑死在同进程，是架构死结不是性能问题 |
+| v1.1 | **`tenant_id` 由客户端声明** —— 多租户做了五个版本，租户身份却是请求体里的一个字符串 |
+| v1.1 | 画像主键是 `user_id` 单列 —— 而 user_id 常是手机号，任何租户拿它就能读到别家客户的偏好与投诉记录 |
+| v1.1 | 拆分形态下 `tool-service` 裸奔 —— 绕过主服务直接打它，v0.12 的高危确认流根本不存在 |
 
 共同点：**单元测试全绿，端到端行为是错的。** 抓住它们的唯一办法，
 是沿着用户真实走的那条路从头跑一遍，并且**先把失效的样子固定成用例**再动手修。

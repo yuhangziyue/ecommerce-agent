@@ -20,6 +20,8 @@ import { PgUsageStore } from '../src/store/pg-usage-store.js';
 import { PgFlowStore } from '../src/store/pg-flow-store.js';
 import { PgConfirmationStore } from '../src/store/pg-confirmation-store.js';
 import { PgTenantConfigStore } from '../src/store/pg-tenant-config-store.js';
+import { PgApiKeyStore } from '../src/store/pg-api-key-store.js';
+import { PgIdempotencyStore } from '../src/store/pg-idempotency-store.js';
 import { NoOpSessionCache } from '../src/store/session-cache.js';
 import { EVAL_CASES, type EvalCase } from '../src/evaluation/cases.js';
 import {
@@ -141,6 +143,8 @@ async function main(): Promise<void> {
     flows: new PgFlowStore(db),
     confirmations: new PgConfirmationStore(db),
     tenantConfigs: new PgTenantConfigStore(db),
+    apiKeys: new PgApiKeyStore(db, 'test'),
+    idempotency: new PgIdempotencyStore(db),
     cache: new NoOpSessionCache(),
     close: async () => {},
   };
@@ -160,6 +164,16 @@ async function main(): Promise<void> {
   console.log(`  用例数: ${EVAL_CASES.length} ｜ 工具数: ${ALL_TOOLS.length}`);
   console.log('  ⚠️  评的是编排层（意图/工具/安全/结构化），不是模型答案质量\n');
 
+  // v1.1：评测走的是真实入口，因此也要真凭证。
+  // 用 admin 是因为用例里带了 tenant_id: 't_eval'（代客口径，见 SPEC P16d）；
+  // 换成不带认证的旁路会让评测测的不再是生产路径
+  const evalKey = await stores.apiKeys.issue({
+    tenantId: 't_eval',
+    scopes: ['chat', 'read', 'write', 'admin'],
+    label: 'offline-eval',
+  });
+  const H = { authorization: `Bearer ${evalKey.plaintext}` };
+
   const results: CaseResult[] = [];
 
   for (const c of EVAL_CASES) {
@@ -167,7 +181,7 @@ async function main(): Promise<void> {
     const app = await buildApp({ stores, config, provider: new EvalProvider(c) });
 
     const started = Date.now();
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat/sync',
       payload: { message: c.input, user_id: 'u_eval', tenant_id: 't_eval' },
@@ -176,7 +190,7 @@ async function main(): Promise<void> {
     const body = JSON.parse(res.body);
 
     // 从会话里读实际调用的工具 —— 比信任 provider 自己的记录可靠
-    const hist = await app.inject({
+    const hist = await app.inject({ headers: H,
       method: 'GET',
       url: `/v1/sessions/${body.session_id}/messages`,
     });
@@ -190,7 +204,7 @@ async function main(): Promise<void> {
     // undefined 记一笔失败，而后面那次补取根本救不回来
     let intent: string | undefined;
     if (c.expectIntent) {
-      const sse = await app.inject({
+      const sse = await app.inject({ headers: H,
         method: 'POST',
         url: '/v1/chat',
         payload: { message: c.input, user_id: 'u_eval', tenant_id: 't_eval' },

@@ -1,12 +1,22 @@
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../../src/server/app.js';
 import { openTestDb, truncateAll, makeTestStores } from '../store/helpers.js';
+import { seedKeyOn, type TestKey } from './helpers.js';
 import { PgSessionStore } from '../../src/store/pg-session-store.js';
 import { PgRefundStore } from '../../src/store/pg-refund-store.js';
 import { Session } from '../../src/core/session.js';
 import { agentEventToSse } from '../../src/server/sse.js';
 import type { Database, SessionStore } from '../../src/store/types.js';
 import type { AgentConfig, ChatProvider, ChatResponse } from '../../src/core/types.js';
+
+/**
+ * v1.1：所有端点都要凭证。这里签一把**带 admin 的**测试钥匙 ——
+ * 本文件测的不是认证，用 admin 是为了让既有用例里 body 带 tenant_id 的写法继续成立
+ *（代客操作，见 SPEC P16d）。认证与租户隔离本身由
+ * `tests/server/auth.test.ts` 与 `tests/server/isolation.test.ts` 专门覆盖。
+ */
+let H: TestKey['headers'];
+
 
 const usage = { inputTokens: 1, outputTokens: 1 };
 
@@ -32,6 +42,7 @@ describe('会话查询接口', () => {
 
   beforeAll(async () => {
     db = await openTestDb();
+    H = (await seedKeyOn(db, { tenantId: 't_test', scopes: ['chat', 'read', 'write', 'admin'] })).headers;
     sessions = new PgSessionStore(db);
     app = await buildApp({
       stores: { ...(await makeTestStores(db)), sessions },
@@ -54,7 +65,7 @@ describe('会话查询接口', () => {
     const session = await Session.create(sessions, { userId: 'u1', tenantId: 't1' });
     await session.appendMessage({ role: 'user', content: 'q', timestamp: 1 });
 
-    const res = await app.inject({ method: 'GET', url: `/v1/sessions/${session.getId()}` });
+    const res = await app.inject({ headers: H, method: 'GET', url: `/v1/sessions/${session.getId()}` });
 
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toMatchObject({
@@ -66,7 +77,7 @@ describe('会话查询接口', () => {
   });
 
   it('GET /v1/sessions/:id 不存在 → 404', async () => {
-    const res = await app.inject({ method: 'GET', url: '/v1/sessions/nope' });
+    const res = await app.inject({ headers: H, method: 'GET', url: '/v1/sessions/nope' });
     expect(res.statusCode).toBe(404);
     expect(JSON.parse(res.body).error.code).toBe('session_not_found');
   });
@@ -86,7 +97,7 @@ describe('会话查询接口', () => {
       durationMs: 3,
     });
 
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'GET',
       url: `/v1/sessions/${session.getId()}/messages`,
     });
@@ -98,7 +109,7 @@ describe('会话查询接口', () => {
   });
 
   it('GET /v1/sessions/:id/messages 不存在 → 404', async () => {
-    const res = await app.inject({ method: 'GET', url: '/v1/sessions/nope/messages' });
+    const res = await app.inject({ headers: H, method: 'GET', url: '/v1/sessions/nope/messages' });
     expect(res.statusCode).toBe(404);
   });
 });
@@ -109,6 +120,7 @@ describe('GET /v1/agents', () => {
 
   beforeAll(async () => {
     db = await openTestDb();
+    H = (await seedKeyOn(db, { tenantId: 't_test', scopes: ['chat', 'read', 'write', 'admin'] })).headers;
     app = await buildApp({ stores: await makeTestStores(db), config, provider: stubProvider });
     await app.ready();
   });
@@ -119,7 +131,7 @@ describe('GET /v1/agents', () => {
   });
 
   it('返回全部领域 Agent 及其意图与工具', async () => {
-    const res = await app.inject({ method: 'GET', url: '/v1/agents' });
+    const res = await app.inject({ headers: H, method: 'GET', url: '/v1/agents' });
     expect(res.statusCode).toBe(200);
 
     const body = JSON.parse(res.body);
@@ -140,6 +152,7 @@ describe('GET /healthz', () => {
 
   beforeAll(async () => {
     db = await openTestDb();
+    H = (await seedKeyOn(db, { tenantId: 't_test', scopes: ['chat', 'read', 'write', 'admin'] })).headers;
     app = await buildApp({
       stores: await makeTestStores(db),
       config,
@@ -154,7 +167,7 @@ describe('GET /healthz', () => {
   });
 
   it('存储可用时 200 并报告引擎', async () => {
-    const res = await app.inject({ method: 'GET', url: '/healthz' });
+    const res = await app.inject({ headers: H, method: 'GET', url: '/healthz' });
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toMatchObject({ status: 'ok', engine: 'pglite', cache: 'noop' });
   });
@@ -174,7 +187,7 @@ describe('GET /healthz', () => {
     });
     await brokenApp.ready();
 
-    const res = await brokenApp.inject({ method: 'GET', url: '/healthz' });
+    const res = await brokenApp.inject({ headers: H, method: 'GET', url: '/healthz' });
     expect(res.statusCode).toBe(503);
     expect(JSON.parse(res.body).error.code).toBe('storage_unavailable');
 

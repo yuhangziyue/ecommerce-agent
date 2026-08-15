@@ -54,3 +54,38 @@ docker compose -f deploy/docker-compose.yml up --build
 - 收到 SIGTERM 后 `/healthz` 立刻转 503，编排系统据此停止派新流量，
   而进程继续服务在途请求至多 `SHUTDOWN_GRACE_MS`
 - `stop_grace_period` 必须 **大于** `SHUTDOWN_GRACE_MS`，否则在途请求会被砍断
+
+
+## v1.1 · 上线前必须做的两件事
+
+### 1. 签发凭证（认证默认开启，不签发就没人能调）
+
+```bash
+docker compose exec agent-service npm run key:issue -- \
+  --tenant t_acme --scopes chat,read --label '官网客服'
+```
+
+明文**只出现这一次** —— 库里存的是 sha256 哈希，我们自己也拿不回来。
+客户丢了只能重新签发，这是正确的行为不是缺陷。
+
+```bash
+docker compose exec agent-service npm run key:issue -- --list   --tenant t_acme
+docker compose exec agent-service npm run key:issue -- --revoke key_xxxx
+```
+
+### 2. 设置 `TOOL_SERVICE_TOKEN`
+
+拆分形态下工具服务是**第二个入口**，而 `POST /v1/tools/execute` 能直接执行退款 ——
+主服务上的高危确认流（v0.12）挡在编排层，绕过去就不存在了。
+不设这个变量时服务会启动并**在日志里警告**，但端口是开放的。
+
+### 环境变量总表（v1.1 新增）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `AGENT_AUTH_DISABLED` | 未设 | 设 `1` 关闭认证。**只用于本地开发**，启动会打警告 |
+| `AGENT_RATE_LIMIT_RPS` | `20` | 每凭证每秒请求数，设 `0` 关闭 |
+| `TOOL_SERVICE_TOKEN` | 未设 | 工具服务共享密钥。两侧都要设且一致 |
+
+限流有 `REDIS_URL` 时全局准确；没有则降级为**进程内令牌桶**——
+多实例下配额是 N 倍。当前档位在 `/healthz` 的 `rate_limit` 字段里看得到。

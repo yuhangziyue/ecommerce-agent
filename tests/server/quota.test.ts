@@ -1,5 +1,6 @@
 import { buildApp } from '../../src/server/app.js';
 import { openTestDb, truncateAll, makeTestStores } from '../store/helpers.js';
+import { seedKeyOn, type TestKey } from './helpers.js';
 import type { Database } from '../../src/store/types.js';
 import type { Stores } from '../../src/store/index.js';
 import type {
@@ -9,6 +10,15 @@ import type {
   ChatResponse,
 } from '../../src/core/types.js';
 import type { FastifyInstance } from 'fastify';
+
+/**
+ * v1.1：所有端点都要凭证。这里签一把**带 admin 的**测试钥匙 ——
+ * 本文件测的不是认证，用 admin 是为了让既有用例里 body 带 tenant_id 的写法继续成立
+ *（代客操作，见 SPEC P16d）。认证与租户隔离本身由
+ * `tests/server/auth.test.ts` 与 `tests/server/isolation.test.ts` 专门覆盖。
+ */
+let H: TestKey['headers'];
+
 
 /** 每次调用烧掉固定 token，便于精确算账 */
 class BurnProvider implements ChatProvider {
@@ -55,6 +65,7 @@ describe('会话配额 · v0.2 那个假的 maxTokensPerSession', () => {
 
   beforeAll(async () => {
     db = await openTestDb();
+    H = (await seedKeyOn(db, { tenantId: 't_test', scopes: ['chat', 'read', 'write', 'admin'] })).headers;
   });
   afterAll(async () => db.close());
 
@@ -72,7 +83,7 @@ describe('会话配额 · v0.2 那个假的 maxTokensPerSession', () => {
   afterEach(async () => app.close());
 
   async function turn(message: string, sessionId?: string) {
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat/sync',
       payload: sessionId
@@ -155,6 +166,7 @@ describe('租户配额 · 429', () => {
 
   beforeAll(async () => {
     db = await openTestDb();
+    H = (await seedKeyOn(db, { tenantId: 't_test', scopes: ['chat', 'read', 'write', 'admin'] })).headers;
   });
   afterAll(async () => db.close());
 
@@ -174,14 +186,14 @@ describe('租户配额 · 429', () => {
   it('🔴 租户配额用尽 → HTTP 429 + quota_exceeded（商业事件，不是对话问题）', async () => {
     // 烧掉 12000 > 10000
     for (let i = 0; i < 2; i++) {
-      await app.inject({
+      await app.inject({ headers: H,
         method: 'POST',
         url: '/v1/chat/sync',
         payload: { message: `第${i}轮`, tenant_id: 't_acme' },
       });
     }
 
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat/sync',
       payload: { message: '还想问', tenant_id: 't_acme' },
@@ -193,7 +205,7 @@ describe('租户配额 · 429', () => {
 
   it('🔴 租户越限时换新会话也没用（与会话配额的本质差别）', async () => {
     for (let i = 0; i < 2; i++) {
-      await app.inject({
+      await app.inject({ headers: H,
         method: 'POST',
         url: '/v1/chat/sync',
         payload: { message: `第${i}轮`, tenant_id: 't_acme' },
@@ -202,7 +214,7 @@ describe('租户配额 · 429', () => {
     const callsBefore = provider.calls;
 
     // 不带 session_id = 全新会话
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat/sync',
       payload: { message: '新会话试试', tenant_id: 't_acme' },
@@ -214,14 +226,14 @@ describe('租户配额 · 429', () => {
 
   it('🔴 另一个租户不受影响（多租户隔离）', async () => {
     for (let i = 0; i < 2; i++) {
-      await app.inject({
+      await app.inject({ headers: H,
         method: 'POST',
         url: '/v1/chat/sync',
         payload: { message: `第${i}轮`, tenant_id: 't_acme' },
       });
     }
 
-    const other = await app.inject({
+    const other = await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat/sync',
       payload: { message: '我是别的租户', tenant_id: 't_globex' },
@@ -231,14 +243,14 @@ describe('租户配额 · 429', () => {
 
   it('SSE 路由同样在写响应头之前返回 429', async () => {
     for (let i = 0; i < 2; i++) {
-      await app.inject({
+      await app.inject({ headers: H,
         method: 'POST',
         url: '/v1/chat',
         payload: { message: `第${i}轮`, tenant_id: 't_acme' },
       });
     }
 
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat',
       payload: { message: '再来', tenant_id: 't_acme' },
@@ -257,6 +269,7 @@ describe('GET /v1/tenants/:id/usage', () => {
 
   beforeAll(async () => {
     db = await openTestDb();
+    H = (await seedKeyOn(db, { tenantId: 't_test', scopes: ['chat', 'read', 'write', 'admin'] })).headers;
   });
   afterAll(async () => db.close());
 
@@ -273,13 +286,13 @@ describe('GET /v1/tenants/:id/usage', () => {
   afterEach(async () => app.close());
 
   it('返回聚合用量与明细', async () => {
-    await app.inject({
+    await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat/sync',
       payload: { message: '你好', tenant_id: 't_acme' },
     });
 
-    const res = await app.inject({ method: 'GET', url: '/v1/tenants/t_acme/usage' });
+    const res = await app.inject({ headers: H, method: 'GET', url: '/v1/tenants/t_acme/usage' });
     expect(res.statusCode).toBe(200);
 
     const body = JSON.parse(res.body);
@@ -292,7 +305,7 @@ describe('GET /v1/tenants/:id/usage', () => {
   });
 
   it('🔴 未知租户返回全零而不是 404（404 会变成租户存在性探测接口）', async () => {
-    const res = await app.inject({ method: 'GET', url: '/v1/tenants/t_nobody/usage' });
+    const res = await app.inject({ headers: H, method: 'GET', url: '/v1/tenants/t_nobody/usage' });
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).summary).toMatchObject({
       billable_tokens: 0,
@@ -302,7 +315,7 @@ describe('GET /v1/tenants/:id/usage', () => {
   });
 
   it('since 非法 → 400（不静默忽略）', async () => {
-    const res = await app.inject({
+    const res = await app.inject({ headers: H,
       method: 'GET',
       url: '/v1/tenants/t_acme/usage?since=不是数字',
     });
@@ -310,26 +323,34 @@ describe('GET /v1/tenants/:id/usage', () => {
     expect(JSON.parse(res.body).error.code).toBe('invalid_since');
   });
 
-  it('🔴 无 tenant_id 的调用记到 anonymous，不丢账', async () => {
-    await app.inject({
+  // v1.1 改写：原用例断言「无 tenant_id 的调用记到 anonymous」。
+  // **那个前提在有认证之后不再存在** —— 每一次调用都带着凭证，凭证必然属于某个租户，
+  // 「不知道这笔账算谁的」这种情况从入口就被消灭了。
+  // anonymous 现在只剩一种来源：显式关闭认证（AGENT_AUTH_DISABLED=1）。
+  it('🔴 body 不带 tenant_id 时，账记到**凭证的租户**而不是 anonymous', async () => {
+    await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat/sync',
-      payload: { message: '匿名调用' },
+      payload: { message: '不带 tenant_id 的调用' },
     });
 
-    const res = await app.inject({ method: 'GET', url: '/v1/tenants/anonymous/usage' });
-    expect(JSON.parse(res.body).summary.call_count).toBeGreaterThan(0);
+    const own = await app.inject({ headers: H, method: 'GET', url: '/v1/tenants/t_test/usage' });
+    expect(JSON.parse(own.body).summary.call_count).toBeGreaterThan(0);
+
+    // 而 anonymous 名下不该再凭空多出账目
+    const anon = await app.inject({ headers: H, method: 'GET', url: '/v1/tenants/anonymous/usage' });
+    expect(JSON.parse(anon.body).summary.call_count).toBe(0);
   });
 
   it('账本记的成本非零且按当时价格解析', async () => {
-    await app.inject({
+    await app.inject({ headers: H,
       method: 'POST',
       url: '/v1/chat/sync',
       payload: { message: '你好', tenant_id: 't_acme' },
     });
 
     const body = JSON.parse(
-      (await app.inject({ method: 'GET', url: '/v1/tenants/t_acme/usage' })).body
+      (await app.inject({ headers: H, method: 'GET', url: '/v1/tenants/t_acme/usage' })).body
     );
     expect(body.summary.cost_usd).toBeGreaterThan(0);
     // 'exact' 表示命中了精确的价格窗口，不是回退到边界价或未知模型价 ——
