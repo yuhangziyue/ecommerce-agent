@@ -12,7 +12,7 @@ import type { TurnContext } from '../src/core/pipeline.js';
 import type { Message } from '../src/core/types.js';
 
 function ctx(userInput = 'hello', messages: Message[] = []): TurnContext {
-  return { sessionId: 'sesn_test', userInput, messages, metadata: {} };
+  return { sessionId: 'sesn_test', userInput, messages, systemAppends: [], metadata: {} };
 }
 
 describe('input-filter 中间件', () => {

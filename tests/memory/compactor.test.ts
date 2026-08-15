@@ -151,6 +151,7 @@ describe('compaction 中间件 · 与 Session 投影协同', () => {
       sessionId: session.getId(),
       userInput: '下一个问题',
       messages: session.getMessages(),
+      systemAppends: [],
       metadata: {},
     };
   }

@@ -11,6 +11,15 @@ export interface TurnContext {
   readonly userId?: string;
   userInput: string;
   messages: Message[];
+  /**
+   * 本轮附加到 system prompt 的上下文（v0.7）。
+   *
+   * 中间件往这里 push，AgentLoop 在调用模型前拼到 systemPrompt 后面。
+   * 存在的理由：用户画像（v0.7）、意图与槽位（v0.8）、路由到的领域 Agent 说明（v0.9）
+   * 都需要「只影响本轮、不污染会话历史」的注入通道 ——
+   * 塞进 userInput 会把它写进历史，塞进 config.systemPrompt 会影响所有会话。
+   */
+  systemAppends: string[];
   readonly metadata: Record<string, unknown>;
 }
 

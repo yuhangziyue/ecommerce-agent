@@ -68,6 +68,20 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user_seq   ON sessions (user_id, seq DES
 CREATE INDEX IF NOT EXISTS idx_sessions_tenant_seq ON sessions (tenant_id, seq DESC);
 `,
   },
+  {
+    // v0.7 长期记忆：用户画像，跨会话持久化
+    name: '003_user_profiles',
+    sql: `
+CREATE TABLE IF NOT EXISTS user_profiles (
+  user_id      TEXT PRIMARY KEY,
+  display_name TEXT,
+  preferences  JSONB NOT NULL DEFAULT '{}'::jsonb,
+  notes        JSONB NOT NULL DEFAULT '[]'::jsonb,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+`,
+  },
 ];
 
 /**
@@ -103,6 +117,6 @@ export async function runMigrations(db: Database): Promise<string[]> {
 /** 清空全部业务表（测试隔离用；不动 schema_migrations，避免每个用例重跑迁移） */
 export async function truncateAll(db: Database): Promise<void> {
   await db.exec(
-    'TRUNCATE session_entries, sessions, refund_tickets RESTART IDENTITY CASCADE;'
+    'TRUNCATE session_entries, sessions, refund_tickets, user_profiles RESTART IDENTITY CASCADE;'
   );
 }

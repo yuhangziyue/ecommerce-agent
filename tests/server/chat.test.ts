@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../../src/server/app.js';
-import { openTestDb, truncateAll } from '../store/helpers.js';
+import { openTestDb, truncateAll, makeTestStores } from '../store/helpers.js';
 import { PgSessionStore } from '../../src/store/pg-session-store.js';
 import { PgRefundStore } from '../../src/store/pg-refund-store.js';
 import type { Database } from '../../src/store/types.js';
@@ -72,12 +72,7 @@ describe('POST /v1/chat（SSE）', () => {
 
   beforeAll(async () => {
     db = await openTestDb();
-    stores = {
-      db,
-      sessions: new PgSessionStore(db),
-      refunds: new PgRefundStore(db),
-      close: async () => {},
-    };
+    stores = await makeTestStores(db);
     provider = new FakeProvider();
     app = await buildApp({ stores, config, provider });
     await app.ready();
@@ -253,12 +248,7 @@ describe('POST /v1/chat/sync', () => {
     db = await openTestDb();
     provider = new FakeProvider();
     app = await buildApp({
-      stores: {
-        db,
-        sessions: new PgSessionStore(db),
-        refunds: new PgRefundStore(db),
-        close: async () => {},
-      },
+      stores: await makeTestStores(db),
       config: {
         model: 'fake-model',
         maxTurns: 5,

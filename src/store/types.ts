@@ -79,3 +79,25 @@ export interface RefundStore {
     reason: string;
   }): Promise<{ ticket: RefundTicketRecord; created: boolean }>;
 }
+
+// ============ 用户画像（v0.7 长期记忆） ============
+
+export interface UserProfile {
+  userId: string;
+  displayName: string | null;
+  /** 结构化偏好：收货时间、称呼、发票抬头等 */
+  preferences: Record<string, unknown>;
+  /** 自由文本备注：历史投诉、特殊要求 */
+  notes: string[];
+  updatedAt: number;
+}
+
+export interface ProfileStore {
+  get(userId: string): Promise<UserProfile | null>;
+  /** 局部更新：只覆盖传入的字段，preferences 做浅合并 */
+  upsert(
+    userId: string,
+    patch: { displayName?: string; preferences?: Record<string, unknown> }
+  ): Promise<UserProfile>;
+  addNote(userId: string, note: string): Promise<UserProfile>;
+}

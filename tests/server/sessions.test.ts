@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../../src/server/app.js';
-import { openTestDb, truncateAll } from '../store/helpers.js';
+import { openTestDb, truncateAll, makeTestStores } from '../store/helpers.js';
 import { PgSessionStore } from '../../src/store/pg-session-store.js';
 import { PgRefundStore } from '../../src/store/pg-refund-store.js';
 import { Session } from '../../src/core/session.js';
@@ -34,7 +34,7 @@ describe('会话查询接口', () => {
     db = await openTestDb();
     sessions = new PgSessionStore(db);
     app = await buildApp({
-      stores: { db, sessions, refunds: new PgRefundStore(db), close: async () => {} },
+      stores: { ...(await makeTestStores(db)), sessions },
       config,
       provider: stubProvider,
     });
@@ -110,12 +110,7 @@ describe('GET /healthz', () => {
   beforeAll(async () => {
     db = await openTestDb();
     app = await buildApp({
-      stores: {
-        db,
-        sessions: new PgSessionStore(db),
-        refunds: new PgRefundStore(db),
-        close: async () => {},
-      },
+      stores: await makeTestStores(db),
       config,
       provider: stubProvider,
     });
@@ -130,7 +125,7 @@ describe('GET /healthz', () => {
   it('存储可用时 200 并报告引擎', async () => {
     const res = await app.inject({ method: 'GET', url: '/healthz' });
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ status: 'ok', engine: 'pglite' });
+    expect(JSON.parse(res.body)).toMatchObject({ status: 'ok', engine: 'pglite', cache: 'noop' });
   });
 
   it('存储不可用时 503（而不是 200 骗上游）', async () => {
@@ -142,12 +137,7 @@ describe('GET /healthz', () => {
       },
     };
     const brokenApp = await buildApp({
-      stores: {
-        db: brokenDb as Database,
-        sessions: new PgSessionStore(brokenDb as Database),
-        refunds: new PgRefundStore(brokenDb as Database),
-        close: async () => {},
-      },
+      stores: await makeTestStores(brokenDb as Database),
       config,
       provider: stubProvider,
     });

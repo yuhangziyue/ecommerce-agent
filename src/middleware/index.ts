@@ -1,4 +1,4 @@
-import { Pipeline } from '../core/pipeline.js';
+import { Pipeline, type AgentMiddleware } from '../core/pipeline.js';
 import { BudgetGuard } from '../guardrails/budget-guard.js';
 import { ContextManager } from '../memory/context-manager.js';
 import type { TokenTracker } from '../core/token-tracker.js';
@@ -11,6 +11,8 @@ export { createInputFilterMiddleware } from './input-filter.mw.js';
 export { createOutputFilterMiddleware } from './output-filter.mw.js';
 export { createBudgetGuardMiddleware } from './budget-guard.mw.js';
 export { createContextTrimMiddleware } from './context-trim.mw.js';
+export { createCompactionMiddleware } from './compaction.mw.js';
+export { createProfileMiddleware } from './profile.mw.js';
 
 export interface DefaultPipelineOptions {
   /** 与 AgentLoop 共享同一个实例，否则预算检查看到的是另一份账 */
@@ -22,6 +24,16 @@ export interface DefaultPipelineOptions {
   onWarn?: (warning: string) => void;
   /** 预算预警比例，默认 0.8 */
   warningThreshold?: number;
+  /** 追加到管道最前的中间件（v0.7 的用户画像注入走这里） */
+  preTurn?: AgentMiddleware[];
+  /**
+   * 插在 `context-trim` **之前**的中间件（v0.7 的摘要压缩走这里）。
+   *
+   * 顺序是硬约束不是偏好：滑窗一旦先跑，老消息已经被丢掉，
+   * 压缩拿不到要压的内容，中期记忆等于不存在。
+   * 把这个约束留在本模块里，调用方不需要知道管道的内部顺序。
+   */
+  beforeTrim?: AgentMiddleware[];
 }
 
 /**
@@ -43,7 +55,9 @@ export function buildDefaultPipeline(opts: DefaultPipelineOptions): Pipeline {
   } = opts;
 
   return new Pipeline([
+    ...(opts.preTurn ?? []),
     createInputFilterMiddleware(),
+    ...(opts.beforeTrim ?? []),
     createContextTrimMiddleware(new ContextManager(maxMessages)),
     createBudgetGuardMiddleware(
       new BudgetGuard(tracker, maxTokens, warningThreshold),

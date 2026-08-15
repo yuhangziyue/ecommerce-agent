@@ -103,6 +103,7 @@ export class AgentLoop {
       sessionId: this.session.getId(),
       userInput,
       messages: this.conversationMessages,
+      systemAppends: [],
       metadata: {},
     };
 
@@ -138,8 +139,14 @@ export class AgentLoop {
 
       let response;
       try {
+        // 中间件本轮追加的 system 上下文（画像/意图/路由说明）拼在基础提示词之后
+        const systemPrompt =
+          ctx.systemAppends.length > 0
+            ? `${this.config.systemPrompt}\n\n${ctx.systemAppends.join('\n\n')}`
+            : this.config.systemPrompt;
+
         response = await this.provider.chat(
-          this.config.systemPrompt,
+          systemPrompt,
           this.conversationMessages,
           this.registry.getAll(),
           { onDelta: (text) => this.emit({ type: 'delta', text }) }

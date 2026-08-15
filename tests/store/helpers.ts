@@ -15,3 +15,21 @@ export async function openTestDb(): Promise<Database> {
 }
 
 export { truncateAll };
+
+/** 组装一套完整的测试 Stores（含画像与 NoOp 缓存） */
+export async function makeTestStores(db: Database) {
+  const { PgSessionStore } = await import('../../src/store/pg-session-store.js');
+  const { PgRefundStore } = await import('../../src/store/pg-refund-store.js');
+  const { PgProfileStore } = await import('../../src/store/pg-profile-store.js');
+  const { NoOpSessionCache } = await import('../../src/store/session-cache.js');
+
+  const cache = new NoOpSessionCache();
+  return {
+    db,
+    sessions: new PgSessionStore(db),
+    refunds: new PgRefundStore(db),
+    profiles: new PgProfileStore(db),
+    cache,
+    close: async () => {},
+  };
+}

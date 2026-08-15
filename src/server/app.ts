@@ -1,5 +1,6 @@
 import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
 import { AgentLoop } from '../core/agent-loop.js';
+import { ModelProvider } from '../core/model-provider.js';
 import { EventBus } from '../core/event-bus.js';
 import { Session } from '../core/session.js';
 import { TokenTracker } from '../core/token-tracker.js';
@@ -9,6 +10,10 @@ import { setRefundStore } from '../tools/refund-store.js';
 import { SYSTEM_PROMPT } from '../prompts/system-prompt.js';
 import { ResponseScorer } from '../evaluation/response-scorer.js';
 import { SseWriter } from './sse.js';
+import { SummaryCompactor } from '../memory/summary-compactor.js';
+import { createCompactionMiddleware } from '../middleware/compaction.mw.js';
+import { createProfileMiddleware } from '../middleware/profile.mw.js';
+import { Pipeline } from '../core/pipeline.js';
 import type { Stores } from '../store/index.js';
 import type { AgentConfig, AgentEvent, ChatProvider } from '../core/types.js';
 
@@ -62,6 +67,26 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   const registry = buildToolRegistry();
   setRefundStore(stores.refunds);
 
+  const compactor = new SummaryCompactor({
+    provider: opts.provider ?? new ModelProvider(config.model, config.apiKey),
+    model: config.model,
+  });
+
+  /** 在默认管道上挂两个记忆中间件（顺序约束由 buildDefaultPipeline 内部保证） */
+  function buildMemoryPipeline(o: {
+    tracker: TokenTracker;
+    session: Session;
+    userId: string | null;
+  }): Pipeline {
+    return buildDefaultPipeline({
+      tracker: o.tracker,
+      maxTokens: config.maxTokensPerSession,
+      maxMessages: 20,
+      preTurn: [createProfileMiddleware({ profiles: stores.profiles, userId: o.userId })],
+      beforeTrim: [createCompactionMiddleware({ compactor, session: o.session })],
+    });
+  }
+
   /**
    * 每请求装配一个 AgentLoop。**进程内不缓存任何会话** ——
    * 代价是每次读一次库（v0.7 用 Redis 热缓存优化），
@@ -99,10 +124,10 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       bus,
       tracker,
       provider: opts.provider,
-      pipeline: buildDefaultPipeline({
+      pipeline: buildMemoryPipeline({
         tracker,
-        maxTokens: config.maxTokensPerSession,
-        maxMessages: 20,
+        session,
+        userId: session.getUserId(),
       }),
       scorer: new ResponseScorer(),
       // 服务端没有交互式确认的通道：高风险工具一律拒绝，
@@ -229,12 +254,34 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     }
   );
 
+  // ============ 用户画像（v0.7 长期记忆） ============
+
+  app.get<{ Params: { id: string } }>('/v1/users/:id/profile', async (request, reply) => {
+    const profile = await stores.profiles.get(request.params.id);
+    if (!profile) {
+      return reply
+        .status(404)
+        .send(errorBody('profile_not_found', `用户 ${request.params.id} 无画像`));
+    }
+    return reply.send({
+      user_id: profile.userId,
+      display_name: profile.displayName,
+      preferences: profile.preferences,
+      notes: profile.notes,
+      updated_at: profile.updatedAt,
+    });
+  });
+
   // ============ 健康检查 ============
 
   app.get('/healthz', async (_request, reply) => {
     try {
       await stores.db.query('SELECT 1');
-      return reply.send({ status: 'ok', engine: stores.db.engine });
+      return reply.send({
+        status: 'ok',
+        engine: stores.db.engine,
+        cache: stores.cache.kind,
+      });
     } catch (err) {
       return reply
         .status(503)

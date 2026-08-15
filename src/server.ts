@@ -25,7 +25,7 @@ async function main(): Promise<void> {
   }
 
   // stores 在进程启动时开一次，请求间共享 —— 不是每请求开库
-  const stores = await openStores(process.env.DATABASE_URL);
+  const stores = await openStores(process.env.DATABASE_URL, process.env.REDIS_URL);
   const app = await buildApp({ stores, config, logger: true });
 
   const port = Number(process.env.PORT || 3000);
@@ -47,12 +47,14 @@ async function main(): Promise<void> {
   console.log('================================================');
   console.log(`  监听:     http://${host}:${port}`);
   console.log(`  存储引擎: ${stores.db.engine}${process.env.DATABASE_URL ? '' : '（PGlite，设 DATABASE_URL 可切真实 PG）'}`);
+  console.log(`  会话缓存: ${stores.cache.kind}${stores.cache.kind === 'noop' ? '（设 REDIS_URL 可启用；不可用时自动降级）' : ''}`);
   console.log(`  模型:     ${config.model}`);
   console.log('');
   console.log('  POST /v1/chat            → SSE 流式');
   console.log('  POST /v1/chat/sync       → JSON 一次性');
   console.log('  GET  /v1/sessions/:id    → 会话元信息');
   console.log('  GET  /v1/sessions/:id/messages');
+  console.log('  GET  /v1/users/:id/profile');
   console.log('  GET  /healthz');
   console.log('================================================\n');
 }
