@@ -1,53 +1,34 @@
-export interface RefundTicket {
-  refundId: string;
-  orderId: string;
-  amount: number;
-  reason: string;
-  createdAt: number;
-}
+import type { RefundStore, RefundTicketRecord } from '../store/types.js';
+
+export type { RefundStore, RefundTicketRecord };
 
 /**
- * 退款工单存储。
+ * 进程内退款工单存储。
  *
- * 存在的理由是**幂等**：v0.3 之前每次调用 `refund_apply` 都生成新工单号，
- * 同一订单可被反复提交 —— 真实业务里这是资金风险，也是客服投诉高发点。
- *
- * ⚠️ 当前实现是**进程内**的，重启即失效，因此本版不宣称「生产级幂等」。
- * 接口先定在这里，v0.5 引入 PostgreSQL 后换成带唯一约束（`UNIQUE(order_id)`）的
- * 持久化实现 —— 那才是真正防得住重启与多实例的幂等。
+ * ⚠️ **仅用于没有数据库的最小化排障场景**。重启即失效、多实例完全无效。
+ * v0.5 起生产路径走 `PgRefundStore`（靠 `UNIQUE(order_id)` 保证真幂等），
+ * 由 `src/index.ts` 在启动时通过 {@link setRefundStore} 注入。
  */
-export interface RefundStore {
-  findByOrderId(orderId: string): RefundTicket | undefined;
-  /** 已存在则返回原工单（不新建），否则创建并返回 */
-  createIfAbsent(input: {
-    orderId: string;
-    amount: number;
-    reason: string;
-  }): { ticket: RefundTicket; created: boolean };
-}
-
 export class InMemoryRefundStore implements RefundStore {
-  private readonly byOrderId = new Map<string, RefundTicket>();
+  private readonly byOrderId = new Map<string, RefundTicketRecord>();
   private seq = 0;
 
-  findByOrderId(orderId: string): RefundTicket | undefined {
+  async findByOrderId(orderId: string): Promise<RefundTicketRecord | undefined> {
     return this.byOrderId.get(orderId);
   }
 
-  createIfAbsent(input: {
+  async createIfAbsent(input: {
     orderId: string;
     amount: number;
     reason: string;
-  }): { ticket: RefundTicket; created: boolean } {
-    // 这里是同步的检查-写入，因此在单线程 JS 里天然是原子的：
-    // 三个并发 execute() 之间没有 await 切点，不会出现两个都查到空再各自插入。
+  }): Promise<{ ticket: RefundTicketRecord; created: boolean }> {
     const existing = this.byOrderId.get(input.orderId);
     if (existing) {
       return { ticket: existing, created: false };
     }
 
     this.seq += 1;
-    const ticket: RefundTicket = {
+    const ticket: RefundTicketRecord = {
       refundId: `REF-${Date.now()}-${String(this.seq).padStart(4, '0')}`,
       orderId: input.orderId,
       amount: input.amount,
@@ -59,13 +40,18 @@ export class InMemoryRefundStore implements RefundStore {
   }
 }
 
-let defaultStore: RefundStore = new InMemoryRefundStore();
+let currentStore: RefundStore = new InMemoryRefundStore();
 
 export function getDefaultRefundStore(): RefundStore {
-  return defaultStore;
+  return currentStore;
 }
 
-/** 测试隔离用：重置进程内单例 */
+/** 启动时注入真实实现（v0.5 起为 `PgRefundStore`） */
+export function setRefundStore(store: RefundStore): void {
+  currentStore = store;
+}
+
+/** 测试隔离用：恢复为全新的进程内实现 */
 export function __resetRefundStore(): void {
-  defaultStore = new InMemoryRefundStore();
+  currentStore = new InMemoryRefundStore();
 }

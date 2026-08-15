@@ -47,7 +47,7 @@ export const refundApplyTool: AgentTool<typeof RefundApplyParams> = {
 
     // v0.3：按订单号幂等。重复申请返回原工单，不新建、不覆盖原始退款原因
     //（审计口径以首次为准）。进程内实现，v0.5 换 PG 唯一约束。
-    const { ticket, created } = getDefaultRefundStore().createIfAbsent({
+    const { ticket, created } = await getDefaultRefundStore().createIfAbsent({
       orderId: params.orderId,
       amount: order.totalAmount,
       reason: params.reason,

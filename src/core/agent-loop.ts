@@ -119,7 +119,7 @@ export class AgentLoop {
       timestamp: Date.now(),
     };
     this.conversationMessages.push(userMessage);
-    this.session.appendMessage(userMessage);
+    await this.session.appendMessage(userMessage);
 
     const toolsUsed: string[] = [];
     let turns = 0;
@@ -167,7 +167,7 @@ export class AgentLoop {
           timestamp: Date.now(),
         };
         this.conversationMessages.push(assistantMessage);
-        this.session.appendMessage(assistantMessage);
+        await this.session.appendMessage(assistantMessage);
 
         if (response.content) {
           this.emit({ type: 'thinking', content: response.content });
@@ -260,7 +260,7 @@ export class AgentLoop {
           toolName: plan.toolUse.name,
           input: plan.toolUse.input,
         });
-        this.session.appendToolCall({
+        await this.session.appendToolCall({
           toolUseId: plan.toolUse.id,
           toolName: plan.toolUse.name,
           input: plan.toolUse.input,
@@ -285,11 +285,11 @@ export class AgentLoop {
       })
     );
 
-    // 阶段 4：按原序回喂
-    plans.forEach((plan, i) => {
+    // 阶段 4：按原序回喂（串行 await —— 落库顺序必须与 tool_use 顺序一致）
+    for (const [i, plan] of plans.entries()) {
       if (!plan.error) toolsUsed.push(plan.toolUse.name);
-      this.pushToolResult(plan.toolUse.id, results[i], plan.durationMs ?? 0);
-    });
+      await this.pushToolResult(plan.toolUse.id, results[i], plan.durationMs ?? 0);
+    }
   }
 
   /**
@@ -313,14 +313,14 @@ export class AgentLoop {
       timestamp: Date.now(),
     };
     this.conversationMessages.push(assistantMessage);
-    this.session.appendMessage(assistantMessage);
+    await this.session.appendMessage(assistantMessage);
 
     if (this.scorer) {
       const score = this.scorer.score(ctx.userInput, reply, toolsUsed);
-      this.session.appendMetadata('score', score);
+      await this.session.appendMetadata('score', score);
     }
     if (post.rewrittenBy.length > 0) {
-      this.session.appendMetadata('rewrittenBy', post.rewrittenBy);
+      await this.session.appendMetadata('rewrittenBy', post.rewrittenBy);
     }
 
     this.emit({ type: 'response', content: reply });
@@ -329,18 +329,18 @@ export class AgentLoop {
   }
 
   /** 被中间件拦截：emit blocked + done（终端事件必须成对，v0.6 SSE 依赖这个保证） */
-  private blockTurn(by: string, reason: string): string {
+  private async blockTurn(by: string, reason: string): Promise<string> {
     this.emit({ type: 'blocked', by, reason });
-    this.session.appendMetadata('blocked', { by, reason });
+    await this.session.appendMetadata('blocked', { by, reason });
     this.emitDone();
     return reason;
   }
 
-  private pushToolResult(
+  private async pushToolResult(
     toolUseId: string,
     result: ToolResult,
     durationMs = 0
-  ): void {
+  ): Promise<void> {
     const message: Message = {
       role: 'tool',
       content: result.content,
@@ -348,7 +348,7 @@ export class AgentLoop {
       timestamp: Date.now(),
     };
     this.conversationMessages.push(message);
-    this.session.appendToolResult({ toolUseId, result, durationMs });
+    await this.session.appendToolResult({ toolUseId, result, durationMs });
   }
 
   private emit(event: AgentEvent): void {

@@ -8,25 +8,7 @@ export class ContextManager {
   }
 
   /**
-   * 固定窗口裁剪：保留 system + 最近 N 条。
-   *
-   * ⚠️ 不做配对保护 —— 切点可能落在 assistant(tool_use) 与其 tool_result 之间。
-   * 生产路径请用 {@link trimSafely}；本方法保留作为对照与向后兼容。
-   */
-  trimMessages(messages: Message[]): Message[] {
-    if (messages.length <= this.maxMessages) {
-      return messages;
-    }
-
-    const systemMessages = messages.filter(m => m.role === 'system');
-    const nonSystemMessages = messages.filter(m => m.role !== 'system');
-    const recentMessages = nonSystemMessages.slice(-this.maxMessages + systemMessages.length);
-
-    return [...systemMessages, ...recentMessages];
-  }
-
-  /**
-   * 配对感知裁剪（生产路径使用）。
+   * 配对感知裁剪。
    *
    * 为什么需要它：Anthropic API 要求每个 `tool_result` 必须紧跟在产生它的
    * `tool_use` 之后。固定窗口盲切一旦落在这对中间，请求会被拒（400），

@@ -73,7 +73,7 @@
 | **v0.2** | 接线与地基 | ⚙️ Guardrail 中间件管道化（前置/后置钩子，非硬编码 if）<br>⚙️ 工具统一走 ToolRegistry | 🔧 6 个：4 组模块运行时零引用、两套工具实现、product-search 字段名错、description 与数据不符、工具每次调用重读磁盘、agent-loop 零测试（额外修：ContextManager 盲切会切散 tool_use/tool_result 配对） |
 | **v0.3** | 核心链路正确性 | ⚙️ 并行工具调用（`toolUses[]` + 单条 user 消息回喂）<br>⚙️ Session 事件溯源一致性（可 restore） | 🔧 4 个：parallel tool_use 丢块、Session.restore 历史残缺、退款非幂等、模型与价格表过期 |
 | **v0.4** | 流式输出 | ⚙️ `messages.stream()` + `delta` 事件<br>⚙️ EventBus 抽象（为多 transport 铺路） | 🛒 用户逐字看到回复，**验收判据必须含用户可感知的实测对比**（首块延迟 vs 全量延迟），不能只有「delta 事件被正确解析」这类内部判据<br>🔧 承接 v0.3 评审 3 项：`resolvePricing` 未命中回退的注释与代码方向相反、价格窗口重叠无校验、UTC 边界假设未写进契约 |
-| **v0.5** | 存储层 | ⚙️ Store 接口族 + PostgreSQL 实现<br>⚙️ docker-compose + 迁移脚本 | 🔧 3 个：JSONL 无并发保护、无法按用户/租户查询、sessions/ 污染仓库 |
+| **v0.5** | 存储层 | ⚙️ Store 接口族 + PostgreSQL 实现（PGlite 本地引擎 / pg 驱动生产，本机无 Docker 故不走 compose）<br>⚙️ 迁移机制 + Session 改异步 | 🔧 3 个：JSONL 无并发保护、无法按用户/租户查询、sessions/ 污染仓库 |
 | **v0.6** | **服务化（对外第一版）** | ⚙️ Fastify + SSE `/v1/chat`<br>⚙️ CLI 降级为服务的瘦客户端 | 🛒 外部系统可接入；不再依赖终端输入 |
 | **v0.7** | 多轮记忆 | ⚙️ 三层记忆（短期滑窗 / 中期摘要压缩 / 长期画像）<br>⚙️ Redis 会话热缓存 | 🛒 跨轮指代消解（"那个订单""刚说的那件"）、跨会话记住偏好<br>🔧 **缓存 token 计价（🔴 必做，随 prompt caching 一起激活）**：`PriceWindow` 加 `cacheRead`(≈0.1×) / `cacheWrite`(1.25× 5m / 2× 1h) 系数；`getTotalTokens()` 现在漏算缓存 token 导致预算熔断失效（API 的 `input_tokens` 只是未命中缓存的剩余部分，真实 prompt 规模 = input + cache_creation + cache_read）<br>🔧 摘掉 `model-provider.ts` 读缓存字段的两处 `as any`（SDK 声明是 `number \| null`，我方是 `?: number`，`as any` 抹掉了 null） |
 | **v0.8** | 多轮意图识别 | ⚙️ 意图 + 槽位 + 置信度识别器<br>⚙️ 意图状态机（澄清→收敛→切换检测） | 🛒 模糊问题主动澄清、话题切换不串线 |
@@ -163,8 +163,8 @@ v0.2 ──▶ v0.3 ──▶ v0.4 ──┐
 | 1 | v0.2 接线与地基 | ✅ 完成 | `v0.2` | 2026-08-14 |
 | 2 | v0.3 核心链路正确性 | ✅ 完成 | `v0.3` | 2026-08-15 |
 | 3 | v0.4 流式输出 | ✅ 完成 | `v0.4` | 2026-08-15 |
-| 4 | v0.5 存储层 | 🚧 下一个 | — | — |
-| 5 | v0.6 服务化 | ⏳ 待开始 | — | — |
+| 4 | v0.5 存储层 | ✅ 完成 | `v0.5` | 2026-08-15 |
+| 5 | v0.6 服务化 | 🚧 下一个 | — | — |
 | 6 | v0.7 多轮记忆 | ⏳ 待开始 | — | — |
 | 7 | v0.8 多轮意图识别 | ⏳ 待开始 | — | — |
 | 8 | v0.9 多 Agent 路由 | ⏳ 待开始 | — | — |

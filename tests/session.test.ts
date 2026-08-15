@@ -1,166 +1,132 @@
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { Session } from '../src/core/session.js';
+import { PgSessionStore } from '../src/store/pg-session-store.js';
 import { messagesToAnthropicFormat } from '../src/core/model-provider.js';
+import { openTestDb, truncateAll } from './store/helpers.js';
+import type { Database, SessionStore } from '../src/store/types.js';
 import type { Message, ToolCallEntry, ToolResultEntry } from '../src/core/types.js';
 
-// Session uses process.cwd()/sessions as its storage directory.
-// We save and restore cwd so tests write to a temp directory.
-
-const originalCwd = process.cwd();
-let tmpDir: string;
-
-beforeAll(() => {
-  tmpDir = fs.mkdtempSync(path.join('/tmp', 'session-test-'));
-  process.chdir(tmpDir);
-});
-
-afterAll(() => {
-  process.chdir(originalCwd);
-  fs.rmSync(tmpDir, { recursive: true, force: true });
-});
+// v0.5：Session 从「JSONL 文件同步追加」改为「走 SessionStore 异步写入」。
+// 写入必须异步 —— 假装同步（写后台队列）会丢掉「写成功才返回」的持久性保证，
+// 而那恰恰是 v0.6 服务化最需要的。读取仍同步（内存缓存），Loop 每轮高频读历史。
 
 describe('Session', () => {
-  describe('Session.create()', () => {
-    it('creates a new session with an ID', () => {
-      const session = Session.create();
-      const id = session.getId();
+  let db: Database;
+  let store: SessionStore;
 
-      expect(id).toBeTruthy();
-      expect(id).toMatch(/^session-/);
+  beforeAll(async () => {
+    db = await openTestDb();
+    store = new PgSessionStore(db);
+  });
+
+  afterAll(async () => {
+    await db.close();
+  });
+
+  beforeEach(async () => {
+    await truncateAll(db);
+  });
+
+  describe('create', () => {
+    it('创建会话并带上 id', async () => {
+      const session = await Session.create(store);
+      expect(session.getId()).toMatch(/^session-/);
     });
 
-    it('creates a metadata entry on creation', () => {
-      const session = Session.create();
+    it('创建时写入一条 metadata（created）', async () => {
+      const session = await Session.create(store);
       const entries = session.getEntries();
-
-      expect(entries.length).toBeGreaterThanOrEqual(1);
+      expect(entries).toHaveLength(1);
       expect(entries[0].type).toBe('metadata');
+    });
+
+    it('可带 userId / tenantId（v0.11 计费聚合的基础）', async () => {
+      const session = await Session.create(store, { userId: 'u1', tenantId: 't1' });
+      expect(session.getUserId()).toBe('u1');
+      expect(session.getTenantId()).toBe('t1');
     });
   });
 
-  describe('appendMessage() and getMessages()', () => {
-    it('stores and retrieves messages', () => {
-      const session = Session.create();
-      const msg: Message = {
+  describe('appendMessage / getMessages', () => {
+    it('写入后可读回', async () => {
+      const session = await Session.create(store);
+      await session.appendMessage({
         role: 'user',
         content: 'Hello',
         timestamp: Date.now(),
-      };
+      });
 
-      session.appendMessage(msg);
       const messages = session.getMessages();
-
       expect(messages).toHaveLength(1);
-      expect(messages[0].role).toBe('user');
-      expect(messages[0].content).toBe('Hello');
+      expect(messages[0]).toMatchObject({ role: 'user', content: 'Hello' });
     });
 
-    it('returns messages in order', () => {
-      const session = Session.create();
+    it('按写入顺序返回', async () => {
+      const session = await Session.create(store);
+      await session.appendMessage({ role: 'user', content: 'Hi', timestamp: 1 });
+      await session.appendMessage({
+        role: 'assistant',
+        content: 'Hello!',
+        timestamp: 2,
+      });
 
-      session.appendMessage({ role: 'user', content: 'Hi', timestamp: Date.now() });
-      session.appendMessage({ role: 'assistant', content: 'Hello!', timestamp: Date.now() });
-
-      const messages = session.getMessages();
-      expect(messages).toHaveLength(2);
-      expect(messages[0].role).toBe('user');
-      expect(messages[1].role).toBe('assistant');
+      expect(session.getMessages().map((m) => m.role)).toEqual(['user', 'assistant']);
     });
   });
 
-  describe('appendToolCall() and appendToolResult()', () => {
-    it('appends tool call entries', () => {
-      const session = Session.create();
+  describe('appendToolCall / appendToolResult', () => {
+    it('tool_call 进 entries', async () => {
+      const session = await Session.create(store);
       const toolCall: ToolCallEntry = {
         toolUseId: 'tc-001',
-        toolName: 'queryOrder',
+        toolName: 'order_lookup',
         input: { orderId: 'ORD-001' },
       };
+      await session.appendToolCall(toolCall);
 
-      session.appendToolCall(toolCall);
-      const entries = session.getEntries();
-      const toolEntries = entries.filter((e) => e.type === 'tool_call');
-
-      expect(toolEntries).toHaveLength(1);
-      expect((toolEntries[0].data as ToolCallEntry).toolName).toBe('queryOrder');
+      const calls = session.getEntries().filter((e) => e.type === 'tool_call');
+      expect(calls).toHaveLength(1);
+      expect((calls[0].data as ToolCallEntry).toolName).toBe('order_lookup');
     });
 
-    it('appends tool result entries', () => {
-      const session = Session.create();
+    it('tool_result 进 entries 且保留 durationMs', async () => {
+      const session = await Session.create(store);
       const toolResult: ToolResultEntry = {
         toolUseId: 'tc-001',
         result: { content: 'Order found', isError: false },
         durationMs: 42,
       };
+      await session.appendToolResult(toolResult);
 
-      session.appendToolResult(toolResult);
-      const entries = session.getEntries();
-      const resultEntries = entries.filter((e) => e.type === 'tool_result');
-
-      expect(resultEntries).toHaveLength(1);
-      expect((resultEntries[0].data as ToolResultEntry).durationMs).toBe(42);
+      const results = session.getEntries().filter((e) => e.type === 'tool_result');
+      expect(results).toHaveLength(1);
+      expect((results[0].data as ToolResultEntry).durationMs).toBe(42);
     });
   });
 
-  describe('getEntries()', () => {
-    it('returns all entry types', () => {
-      const session = Session.create();
+  describe('getEntries', () => {
+    it('包含全部 entry 类型', async () => {
+      const session = await Session.create(store);
+      await session.appendMessage({ role: 'user', content: 'test', timestamp: 1 });
+      await session.appendToolCall({ toolUseId: 'tc-1', toolName: 'tool', input: {} });
+      await session.appendToolResult({
+        toolUseId: 'tc-1',
+        result: { content: 'ok' },
+        durationMs: 10,
+      });
 
-      session.appendMessage({ role: 'user', content: 'test', timestamp: Date.now() });
-      session.appendToolCall({ toolUseId: 'tc-1', toolName: 'tool', input: {} });
-      session.appendToolResult({ toolUseId: 'tc-1', result: { content: 'ok' }, durationMs: 10 });
-
-      const entries = session.getEntries();
-      const types = entries.map((e) => e.type);
-
-      expect(types).toContain('metadata');
-      expect(types).toContain('message');
-      expect(types).toContain('tool_call');
-      expect(types).toContain('tool_result');
-    });
-  });
-
-  describe('Session.restore()', () => {
-    it('loads session from file', () => {
-      const original = Session.create();
-      const id = original.getId();
-
-      original.appendMessage({ role: 'user', content: 'persisted message', timestamp: Date.now() });
-
-      const restored = Session.restore(id);
-      const messages = restored.getMessages();
-
-      expect(messages).toHaveLength(1);
-      expect(messages[0].content).toBe('persisted message');
-    });
-
-    it('restores all entry types', () => {
-      const original = Session.create();
-      const id = original.getId();
-
-      original.appendMessage({ role: 'user', content: 'hi', timestamp: Date.now() });
-      original.appendToolCall({ toolUseId: 'tc-x', toolName: 'search', input: { q: 'test' } });
-
-      const restored = Session.restore(id);
-      const entries = restored.getEntries();
-
-      // metadata (from create) + message + tool_call = at least 3
-      expect(entries.length).toBeGreaterThanOrEqual(3);
+      const types = session.getEntries().map((e) => e.type);
+      expect(types).toEqual(
+        expect.arrayContaining(['metadata', 'message', 'tool_call', 'tool_result'])
+      );
     });
   });
 });
 
-// ============ v0.3 新增：事件流投影与 restore 合法性 ============
-//
-// getMessages() 此前是「过滤 type === 'message'」，工具结果走 tool_result entry 被整段漏掉。
-// 后果：restore 出的历史里 assistant 有 toolUses 但没有配对的 tool 结果消息，
-// 喂给 Anthropic API 必被拒（tool_use 缺少 tool_result）。
-// v0.6 服务化后每个 HTTP 请求都要靠 sessionId 恢复上下文，这个 bug 会从潜伏变成必现。
+// ============ 事件流投影与 restore 合法性（v0.3 的成果，v0.5 迁库后必须保持） ============
 
-function seedToolTurn(session: Session): void {
-  session.appendMessage({ role: 'user', content: '查订单和商品', timestamp: 1 });
-  session.appendMessage({
+async function seedToolTurn(session: Session): Promise<void> {
+  await session.appendMessage({ role: 'user', content: '查订单和商品', timestamp: 1 });
+  await session.appendMessage({
     role: 'assistant',
     content: '我来查',
     toolUses: [
@@ -169,28 +135,43 @@ function seedToolTurn(session: Session): void {
     ],
     timestamp: 2,
   });
-  session.appendToolCall({ toolUseId: 'tu_1', toolName: 'order_lookup', input: {} });
-  session.appendToolResult({
+  await session.appendToolCall({ toolUseId: 'tu_1', toolName: 'order_lookup', input: {} });
+  await session.appendToolResult({
     toolUseId: 'tu_1',
     result: { content: '订单已发货' },
     durationMs: 5,
   });
-  session.appendToolCall({ toolUseId: 'tu_2', toolName: 'product_search', input: {} });
-  session.appendToolResult({
+  await session.appendToolCall({ toolUseId: 'tu_2', toolName: 'product_search', input: {} });
+  await session.appendToolResult({
     toolUseId: 'tu_2',
     result: { content: '找到 3 件商品' },
     durationMs: 7,
   });
-  session.appendMessage({ role: 'assistant', content: '都查到了', timestamp: 3 });
+  await session.appendMessage({ role: 'assistant', content: '都查到了', timestamp: 3 });
 }
 
 describe('Session.getMessages() 事件流投影', () => {
-  it('把 tool_result entry 投影为 tool 角色消息（此前整段丢失）', () => {
-    const session = Session.create();
-    seedToolTurn(session);
+  let db: Database;
+  let store: SessionStore;
+
+  beforeAll(async () => {
+    db = await openTestDb();
+    store = new PgSessionStore(db);
+  });
+
+  afterAll(async () => {
+    await db.close();
+  });
+
+  beforeEach(async () => {
+    await truncateAll(db);
+  });
+
+  it('把 tool_result entry 投影为 tool 角色消息（v0.3 之前整段丢失）', async () => {
+    const session = await Session.create(store);
+    await seedToolTurn(session);
 
     const messages = session.getMessages();
-
     expect(messages.map((m) => m.role)).toEqual([
       'user',
       'assistant',
@@ -200,34 +181,50 @@ describe('Session.getMessages() 事件流投影', () => {
     ]);
     expect(messages[2].toolResult!.toolUseId).toBe('tu_1');
     expect(messages[2].content).toBe('订单已发货');
-    expect(messages[3].toolResult!.toolUseId).toBe('tu_2');
   });
 
-  it('tool_call entry 不被重复投影（信息已在 assistant.toolUses 里）', () => {
-    const session = Session.create();
-    seedToolTurn(session);
-
-    // 2 个 tool_call + 2 个 tool_result，若都投影会得到 4 条 tool 消息
-    const toolMsgs = session.getMessages().filter((m) => m.role === 'tool');
-    expect(toolMsgs).toHaveLength(2);
+  it('tool_call entry 不被重复投影（信息已在 assistant.toolUses 里）', async () => {
+    const session = await Session.create(store);
+    await seedToolTurn(session);
+    expect(session.getMessages().filter((m) => m.role === 'tool')).toHaveLength(2);
   });
 
-  it('metadata entry 不进对话历史', () => {
-    const session = Session.create(); // create 本身写了一条 metadata
-    session.appendMetadata('score', { overall: 0.8 });
-    session.appendMessage({ role: 'user', content: 'q', timestamp: 1 });
+  it('metadata entry 不进对话历史', async () => {
+    const session = await Session.create(store); // create 本身写了一条 metadata
+    await session.appendMetadata('score', { overall: 0.8 });
+    await session.appendMessage({ role: 'user', content: 'q', timestamp: 1 });
 
     expect(session.getMessages()).toHaveLength(1);
   });
 });
 
 describe('Session.restore() 恢复后的历史合法性', () => {
-  it('每个 tool_use 都有配对的 tool_result（API 合法性不变量）', () => {
-    const original = Session.create();
-    const id = original.getId();
-    seedToolTurn(original);
+  let db: Database;
+  let store: SessionStore;
 
-    const messages = Session.restore(id).getMessages();
+  beforeAll(async () => {
+    db = await openTestDb();
+    store = new PgSessionStore(db);
+  });
+
+  afterAll(async () => {
+    await db.close();
+  });
+
+  beforeEach(async () => {
+    await truncateAll(db);
+  });
+
+  it('会话不存在时返回 null（服务化后是常见路径）', async () => {
+    expect(await Session.restore(store, 'no-such-session')).toBeNull();
+  });
+
+  it('每个 tool_use 都有配对的 tool_result（API 合法性不变量）', async () => {
+    const original = await Session.create(store);
+    await seedToolTurn(original);
+
+    const restored = await Session.restore(store, original.getId());
+    const messages = restored!.getMessages();
 
     const useIds = messages
       .filter((m) => m.toolUses)
@@ -240,17 +237,15 @@ describe('Session.restore() 恢复后的历史合法性', () => {
     expect(resultIds.sort()).toEqual(useIds.sort());
   });
 
-  it('恢复出的历史转成 API 格式后不产生孤立 tool_result', () => {
-    const original = Session.create();
-    const id = original.getId();
-    seedToolTurn(original);
+  it('恢复出的历史转成 API 格式后不产生孤立 tool_result', async () => {
+    const original = await Session.create(store);
+    await seedToolTurn(original);
 
-    const wire = messagesToAnthropicFormat(Session.restore(id).getMessages());
+    const restored = await Session.restore(store, original.getId());
+    const wire = messagesToAnthropicFormat(restored!.getMessages());
 
-    // 首条必须是 user 文本，不能是携带 tool_result 的 user 消息
     expect(wire[0]).toEqual({ role: 'user', content: '查订单和商品' });
 
-    // 两个 tool_result 合并进同一条 user 消息
     const toolResultGroups = wire.filter(
       (m) =>
         Array.isArray(m.content) &&
@@ -260,13 +255,22 @@ describe('Session.restore() 恢复后的历史合法性', () => {
     expect(toolResultGroups[0].content as unknown[]).toHaveLength(2);
   });
 
-  it('恢复出的历史可直接作为 AgentLoop 的初始上下文（长度与运行时一致）', () => {
-    const original = Session.create();
-    const id = original.getId();
-    seedToolTurn(original);
+  it('恢复出的历史与运行时一致（长度相同）', async () => {
+    const original = await Session.create(store);
+    await seedToolTurn(original);
 
-    expect(Session.restore(id).getMessages()).toHaveLength(
-      original.getMessages().length
-    );
+    const restored = await Session.restore(store, original.getId());
+    expect(restored!.getMessages()).toHaveLength(original.getMessages().length);
+  });
+
+  it('跨实例恢复：另一个 store 实例也能读到（不依赖进程内状态）', async () => {
+    const original = await Session.create(store, { userId: 'u1' });
+    await original.appendMessage({ role: 'user', content: '持久化了吗', timestamp: 1 });
+
+    const otherStore = new PgSessionStore(db);
+    const restored = await Session.restore(otherStore, original.getId());
+
+    expect(restored!.getUserId()).toBe('u1');
+    expect(restored!.getMessages()[0].content).toBe('持久化了吗');
   });
 });

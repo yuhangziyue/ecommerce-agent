@@ -6,6 +6,8 @@ import { TokenTracker } from './core/token-tracker.js';
 import { SYSTEM_PROMPT } from './prompts/system-prompt.js';
 import { buildToolRegistry } from './tools/index.js';
 import { buildDefaultPipeline } from './middleware/index.js';
+import { openStores } from './store/index.js';
+import { setRefundStore } from './tools/refund-store.js';
 import { ResponseScorer } from './evaluation/response-scorer.js';
 import { TrajectoryLogger } from './evaluation/trajectory-logger.js';
 import type { AgentConfig } from './core/types.js';
@@ -47,7 +49,14 @@ async function main() {
   // ============ 装配 ============
 
   const registry = buildToolRegistry();
-  const session = Session.create();
+
+  // v0.5：会话落 PostgreSQL。无 DATABASE_URL 时走 PGlite（进程内真 Postgres，零配置）
+  const stores = await openStores(process.env.DATABASE_URL);
+  setRefundStore(stores.refunds);
+  const session = await Session.create(stores.sessions, {
+    userId: process.env.AGENT_USER_ID,
+    tenantId: process.env.AGENT_TENANT_ID,
+  });
   // tracker 必须在 Loop 与 BudgetGuard 之间共享，否则两边各记一份账、熔断永不触发
   const tracker = new TokenTracker();
   const pipeline = buildDefaultPipeline({
@@ -137,6 +146,7 @@ async function main() {
   console.log('  好买电商 AI 客服');
   console.log('  输入您的问题，输入 exit 或 quit 退出');
   console.log(`  会话ID: ${session.getId()}`);
+  console.log(`  存储引擎: ${stores.db.engine}${process.env.DATABASE_URL ? '' : '（PGlite，设 DATABASE_URL 可切真实 PG）'}`);
   console.log(`  已装载工具: ${registry.getAll().map((t) => t.name).join(', ')}`);
   console.log(`  已装载中间件: ${agent.getPipelineNames().join(' → ')}`);
   console.log('================================================\n');
@@ -166,6 +176,7 @@ async function main() {
   console.log('================================================\n');
 
   rl.close();
+  await stores.close();
   process.exit(0);
 }
 
