@@ -2,6 +2,7 @@ import { buildApp } from './server/app.js';
 import { openStores } from './store/index.js';
 import { SYSTEM_PROMPT } from './prompts/system-prompt.js';
 import type { AgentConfig } from './core/types.js';
+import { parseSafetyLag } from './server/config.js';
 
 /**
  * HTTP 服务入口（`npm run serve`）。
@@ -17,6 +18,8 @@ async function main(): Promise<void> {
     systemPrompt: SYSTEM_PROMPT,
     // 服务端没有交互式确认通道 —— 高风险工具一律拒绝，由模型改走 human_handoff
     confirmHighRisk: true,
+    // 面向消费者的客服场景，跨块的 PII 泄露风险高于那几十毫秒首字延迟
+    safetyLag: parseSafetyLag(process.env.AGENT_SAFETY_LAG),
   };
 
   if (!config.apiKey) {

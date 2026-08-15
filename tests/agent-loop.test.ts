@@ -418,7 +418,7 @@ describe('AgentLoop · 中间件接线（v0.2 核心验收）', () => {
     expect(reply).toContain('注入');
 
     const blocked = h.events.find((e) => e.type === 'blocked');
-    expect(blocked).toMatchObject({ type: 'blocked', by: 'input-filter' });
+    expect(blocked).toMatchObject({ type: 'blocked', by: 'safety' });
   });
 
   it('被拦截的轮次不写入用户消息（不污染会话历史）', async () => {

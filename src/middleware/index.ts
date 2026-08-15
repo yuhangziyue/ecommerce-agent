@@ -2,10 +2,10 @@ import { Pipeline, type AgentMiddleware } from '../core/pipeline.js';
 import { BudgetGuard } from '../guardrails/budget-guard.js';
 import { ContextManager } from '../memory/context-manager.js';
 import type { TokenTracker } from '../core/token-tracker.js';
-import { createInputFilterMiddleware } from './input-filter.mw.js';
 import { createContextTrimMiddleware } from './context-trim.mw.js';
 import { createBudgetGuardMiddleware } from './budget-guard.mw.js';
-import { createOutputFilterMiddleware } from './output-filter.mw.js';
+import { createSafetyMiddleware, type SafetyAuditEntry } from './safety.mw.js';
+import type { Session } from '../core/session.js';
 
 export { createInputFilterMiddleware } from './input-filter.mw.js';
 export { createOutputFilterMiddleware } from './output-filter.mw.js';
@@ -13,6 +13,12 @@ export { createBudgetGuardMiddleware } from './budget-guard.mw.js';
 export { createContextTrimMiddleware } from './context-trim.mw.js';
 export { createCompactionMiddleware } from './compaction.mw.js';
 export { createProfileMiddleware } from './profile.mw.js';
+export {
+  createSafetyMiddleware,
+  readSafetyAudit,
+  SAFETY_AUDIT_KEY,
+  type SafetyAuditEntry,
+} from './safety.mw.js';
 
 export interface DefaultPipelineOptions {
   /** 与 AgentLoop 共享同一个实例，否则预算检查看到的是另一份账 */
@@ -40,16 +46,26 @@ export interface DefaultPipelineOptions {
    * 把这个约束留在本模块里，调用方不需要知道管道的内部顺序。
    */
   beforeTrim?: AgentMiddleware[];
+  /**
+   * v0.10 安全中间件的接线（取代 v0.2 的 input-filter / output-filter）。
+   *
+   * `session` 用于把每次非 allow 的裁决写成审计条目 —— 不传就只有内存回调，
+   * 排障时查不到「上周三那次拦截是哪条规则命中的」。
+   */
+  safety?: {
+    session?: Session;
+    onVerdict?: (entry: SafetyAuditEntry) => void;
+  };
 }
 
 /**
  * 装配默认管道。
  *
  * 顺序是刻意的：
- * 1. `input-filter`  最先 —— 恶意输入不该走到后面任何一步，更不该消耗 token
- * 2. `context-trim`  在预算检查前 —— 先把该丢的历史丢掉，再判断预算，否则可能误熔断
- * 3. `budget-guard`  裁剪之后 —— 判断的是真实将要发出的规模
- * 4. `output-filter` 最后 —— 对最终文本做脱敏，前面任何改写都已定稿
+ * 1. `safety`       最先 —— 恶意输入不该走到后面任何一步，更不该消耗 token；
+ *                   同一实例的 `afterTurn` 兼管输出脱敏（v0.10 合并了原来的两个过滤器）
+ * 2. `context-trim` 在预算检查前 —— 先把该丢的历史丢掉，再判断预算，否则可能误熔断
+ * 3. `budget-guard` 裁剪之后 —— 判断的是真实将要发出的规模
  */
 export function buildDefaultPipeline(opts: DefaultPipelineOptions): Pipeline {
   const {
@@ -60,8 +76,12 @@ export function buildDefaultPipeline(opts: DefaultPipelineOptions): Pipeline {
     warningThreshold = 0.8,
   } = opts;
 
+  // 安全中间件一个实例挂两头：beforeTurn 判入参、afterTurn 脱敏出参。
+  // 拆成两个实例会让审计回调各记一份，统计口径对不上。
+  const safety = createSafetyMiddleware(opts.safety ?? {});
+
   return new Pipeline([
-    createInputFilterMiddleware(),
+    safety,
     ...(opts.enrich ?? []),
     ...(opts.beforeTrim ?? []),
     createContextTrimMiddleware(new ContextManager(maxMessages)),
@@ -69,6 +89,5 @@ export function buildDefaultPipeline(opts: DefaultPipelineOptions): Pipeline {
       new BudgetGuard(tracker, maxTokens, warningThreshold),
       onWarn
     ),
-    createOutputFilterMiddleware(),
   ]);
 }

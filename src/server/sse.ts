@@ -73,6 +73,20 @@ export class SseWriter {
     this.safeWrite(frame('routing', payload));
   }
 
+  /**
+   * 安全裁决（v0.10）。
+   *
+   * 只发规则 id / 名称 / 处置，**不发命中的原文** —— 那本身就是要保护的内容，
+   * 通过 SSE 回给前端等于自己把它泄出去。
+   */
+  writeSafety(payload: {
+    stage: 'input' | 'output';
+    action: 'mask' | 'block' | 'handoff';
+    rules: string[];
+  }): void {
+    this.safeWrite(frame('safety', payload));
+  }
+
   writeEvent(event: AgentEvent): void {
     this.safeWrite(agentEventToSse(event));
   }

@@ -97,6 +97,13 @@ export interface AgentConfig {
   maxTokensPerSession: number;
   systemPrompt: string;
   confirmHighRisk: boolean;
+  /**
+   * v0.10：流式脱敏的滞后窗口字符数。缺省 `DEFAULT_SAFETY_LAG`（40）。
+   *
+   * 设 0 关闭滞后 —— 换回 v0.4 的首字延迟，代价是**跨块的敏感串检测不到**。
+   * 这个取舍要按场景定：面向消费者的客服流该开，内部工具链可以关。
+   */
+  safetyLag?: number;
 }
 
 // Agent events (流式事件)

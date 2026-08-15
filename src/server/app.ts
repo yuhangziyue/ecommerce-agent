@@ -4,7 +4,10 @@ import { ModelProvider } from '../core/model-provider.js';
 import { EventBus } from '../core/event-bus.js';
 import { Session } from '../core/session.js';
 import { TokenTracker } from '../core/token-tracker.js';
-import { buildDefaultPipeline } from '../middleware/index.js';
+import { buildDefaultPipeline, type SafetyAuditEntry } from '../middleware/index.js';
+import { StreamingRedactor } from '../safety/streaming-redactor.js';
+import { SafetyScanner } from '../safety/scanner.js';
+import { DEFAULT_SAFETY_LAG } from '../safety/rules.js';
 import { buildToolRegistry } from '../tools/index.js';
 import { setRefundStore } from '../tools/refund-store.js';
 import { SYSTEM_PROMPT } from '../prompts/system-prompt.js';
@@ -85,11 +88,13 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     userId: string | null;
     onIntent?: (state: IntentState) => void;
     onRouted?: (agent: DomainAgent) => void;
+    onSafety?: (entry: SafetyAuditEntry) => void;
   }): Pipeline {
     return buildDefaultPipeline({
       tracker: o.tracker,
       maxTokens: config.maxTokensPerSession,
       maxMessages: 20,
+      safety: { session: o.session, onVerdict: o.onSafety },
       enrich: [
         createProfileMiddleware({ profiles: stores.profiles, userId: o.userId }),
         createIntentMiddleware({
@@ -111,8 +116,11 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
    */
   async function prepareTurn(
     body: ChatBody,
-    onIntent?: (state: IntentState) => void,
-    onRouted?: (agent: DomainAgent) => void
+    hooks: {
+      onIntent?: (state: IntentState) => void;
+      onRouted?: (agent: DomainAgent) => void;
+      onSafety?: (entry: SafetyAuditEntry) => void;
+    } = {}
   ): Promise<
     | { ok: true; session: Session; loop: AgentLoop; bus: EventBus; tracker: TokenTracker }
     | { ok: false; status: number; code: string; message: string }
@@ -149,9 +157,17 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         tracker,
         session,
         userId: session.getUserId(),
-        onIntent,
-        onRouted,
+        onIntent: hooks.onIntent,
+        onRouted: hooks.onRouted,
+        onSafety: hooks.onSafety,
       }),
+      // v0.10：delta 必须过脱敏器再出门。少了这一行，afterTurn 的脱敏只保护
+      // 非流式返回值，未脱敏的手机号已经先一步打到用户屏幕上了（v0.4 的洞）。
+      redactor: () =>
+        new StreamingRedactor(
+          SafetyScanner.forOutput(),
+          config.safetyLag ?? DEFAULT_SAFETY_LAG
+        ),
       scorer: new ResponseScorer(),
       // 服务端没有交互式确认的通道：高风险工具一律拒绝，
       // 由模型改走 human_handoff。真正的异步确认归 v0.12 业务流状态机。
@@ -168,21 +184,29 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     { schema: { body: CHAT_BODY_SCHEMA } },
     async (request, reply) => {
       let writer: SseWriter | undefined;
-      const prepared = await prepareTurn(request.body, (state) =>
-        writer?.writeIntent({
-          intent: state.intent,
-          confidence: state.confidence,
-          phase: state.phase,
-          slots: state.slots as Record<string, unknown>,
-          missing: state.missing,
-        }),
-        (agent) =>
+      const prepared = await prepareTurn(request.body, {
+        onIntent: (state) =>
+          writer?.writeIntent({
+            intent: state.intent,
+            confidence: state.confidence,
+            phase: state.phase,
+            slots: state.slots as Record<string, unknown>,
+            missing: state.missing,
+          }),
+        onRouted: (agent) =>
           writer?.writeRouting({
             agent: agent.id,
             name: agent.name,
             tools: agent.toolNames,
-          })
-      );
+          }),
+        onSafety: (entry) =>
+          writer?.writeSafety({
+            stage: entry.stage,
+            action: entry.action,
+            // 只发规则名，不发命中原文
+            rules: [...new Set(entry.matches.map((m) => m.ruleName))],
+          }),
+      });
       if (!prepared.ok) {
         return reply
           .status(prepared.status)

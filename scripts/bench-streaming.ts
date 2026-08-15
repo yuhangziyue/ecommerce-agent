@@ -16,6 +16,13 @@ import { AgentLoop } from '../src/core/agent-loop.js';
 import { Session } from '../src/core/session.js';
 import { buildToolRegistry } from '../src/tools/index.js';
 import { SYSTEM_PROMPT } from '../src/prompts/system-prompt.js';
+import { PGliteDatabase } from '../src/store/database.js';
+import { runMigrations } from '../src/store/migrations.js';
+import { PgSessionStore } from '../src/store/pg-session-store.js';
+import { StreamingRedactor } from '../src/safety/streaming-redactor.js';
+import { SafetyScanner } from '../src/safety/scanner.js';
+import { DEFAULT_SAFETY_LAG } from '../src/safety/rules.js';
+import type { SessionStore } from '../src/store/types.js';
 import type {
   AgentConfig,
   AgentTool,
@@ -68,7 +75,13 @@ interface Sample {
   fullMs: number;
 }
 
-async function runOnce(provider: ChatProvider, model: string): Promise<Sample> {
+async function runOnce(
+  provider: ChatProvider,
+  model: string,
+  store: SessionStore,
+  /** v0.10：流式脱敏的滞后窗口。undefined = 不挂脱敏器（v0.4 行为） */
+  lag?: number
+): Promise<Sample> {
   const config: AgentConfig = {
     model,
     apiKey: process.env.ANTHROPIC_API_KEY,
@@ -84,8 +97,12 @@ async function runOnce(provider: ChatProvider, model: string): Promise<Sample> {
   const loop = new AgentLoop({
     config,
     registry: buildToolRegistry(),
-    session: Session.create(),
+    session: await Session.create(store, { userId: 'bench' }),
     provider,
+    redactor:
+      lag === undefined
+        ? undefined
+        : () => new StreamingRedactor(SafetyScanner.forOutput(), lag),
     onEvent: (event) => {
       if (firstByteMs !== -1) return;
       // 用户「看到第一个字」的时刻：流式是首个 delta，非流式只能等 response
@@ -121,9 +138,16 @@ async function main(): Promise<void> {
   }
   console.log(`  轮次: ${ROUNDS}（取中位数）\n`);
 
-  const modes: Array<{ name: string; streaming: boolean }> = [
+  // 纯内存 PGlite —— 基准不该依赖外部库，也不该把 .data/pg 写脏
+  const db = await PGliteDatabase.open();
+  await runMigrations(db);
+  const store = new PgSessionStore(db);
+
+  const modes: Array<{ name: string; streaming: boolean; lag?: number }> = [
     { name: '非流式（v0.3 行为）', streaming: false },
-    { name: '流式（v0.4）', streaming: true },
+    { name: '流式·无脱敏（v0.4）', streaming: true },
+    { name: `流式·脱敏 lag=${DEFAULT_SAFETY_LAG}（v0.10）`, streaming: true, lag: DEFAULT_SAFETY_LAG },
+    { name: '流式·脱敏 lag=0（可关）', streaming: true, lag: 0 },
   ];
 
   const results: Record<string, Sample[]> = {};
@@ -131,7 +155,9 @@ async function main(): Promise<void> {
   for (const mode of modes) {
     const samples: Sample[] = [];
     for (let i = 0; i < ROUNDS; i++) {
-      samples.push(await runOnce(new SimulatedProvider(mode.streaming), model));
+      samples.push(
+        await runOnce(new SimulatedProvider(mode.streaming), model, store, mode.lag)
+      );
     }
     results[mode.name] = samples;
   }
@@ -150,6 +176,7 @@ async function main(): Promise<void> {
 
   const nonStream = median(results[modes[0].name].map((x) => x.firstByteMs));
   const stream = median(results[modes[1].name].map((x) => x.firstByteMs));
+  const redacted = median(results[modes[2].name].map((x) => x.firstByteMs));
   console.log('-'.repeat(78));
   console.log(
     `\n  首块延迟：${nonStream}ms → ${stream}ms，` +
@@ -159,6 +186,22 @@ async function main(): Promise<void> {
     '  全量延迟基本不变 —— 流式改善的是**感知等待**，不是总耗时。这正是重点：\n' +
       '  用户判断「卡没卡」看的是第一个字什么时候出现，不是最后一个字。\n'
   );
+
+  // v0.10：滞后窗口的代价必须摆在明面上，不能只说「有一点开销」
+  const cost = redacted - stream;
+  const kept = nonStream - redacted;
+  console.log('-'.repeat(78));
+  console.log(
+    `  滞后窗口(lag=${DEFAULT_SAFETY_LAG})的代价：首块延迟 ${stream}ms → ${redacted}ms（+${cost}ms）\n` +
+      `  相对非流式仍提前 ${kept}ms —— v0.4 的收益基本保住了。\n\n` +
+      '  为什么几乎不要钱：滞后窗口只压住**可能长成敏感串的尾巴**（连续的\n' +
+      '  数字/字母/@._+-），而不是无条件压住 lag 个字符。客服回复以中文为主，\n' +
+      '  汉字与标点一到就能放行，绝大多数时候窗口是空的。\n' +
+      '  代价出现在长串字母数字上（订单号、运单号）—— 那几个字会晚几十毫秒。\n' +
+      '  确实不需要跨块保护的场景可设 AGENT_SAFETY_LAG=0 完全关掉。\n'
+  );
+
+  await db.close();
 }
 
 main().catch((err) => {

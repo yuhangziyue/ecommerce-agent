@@ -6,6 +6,7 @@ import { EventBus } from './event-bus.js';
 import type { ToolRegistry } from '../tools/tool-registry.js';
 import type { ResponseScorer } from '../evaluation/response-scorer.js';
 import type { TrajectoryLogger } from '../evaluation/trajectory-logger.js';
+import type { StreamingRedactor } from '../safety/streaming-redactor.js';
 import type {
   AgentConfig,
   AgentEvent,
@@ -56,6 +57,11 @@ export interface AgentLoopDeps {
   onConfirm?: ConfirmHandler;
   scorer?: ResponseScorer;
   trajectory?: TrajectoryLogger;
+  /**
+   * v0.10：流式脱敏器工厂。**每次模型调用新建一个** —— 脱敏器持有缓冲区状态，
+   * 跨调用复用会把上一次的尾巴混进这一次。缺省表示 delta 直放（v0.4 行为）。
+   */
+  redactor?: () => StreamingRedactor;
 }
 
 export class AgentLoop {
@@ -68,6 +74,7 @@ export class AgentLoop {
   private readonly bus: EventBus;
   private readonly onConfirm: ConfirmHandler;
   private readonly scorer?: ResponseScorer;
+  private readonly redactorFactory?: () => StreamingRedactor;
   private conversationMessages: Message[] = [];
 
   constructor(deps: AgentLoopDeps) {
@@ -80,6 +87,7 @@ export class AgentLoop {
     this.pipeline = deps.pipeline ?? new Pipeline([]);
     this.onConfirm = deps.onConfirm ?? (async () => true);
     this.scorer = deps.scorer;
+    this.redactorFactory = deps.redactor;
 
     // v0.4：事件分发收敛到总线。`onEvent` 与 `trajectory` 从「Loop 的两套并行机制」
     // 降级为两个普通订阅者 —— 调用方签名不变，但 v0.6 的 SSE 写出器可以直接
@@ -138,6 +146,14 @@ export class AgentLoop {
       this.conversationMessages = ctx.messages;
 
       let response;
+      // v0.10：每次模型调用一个独立脱敏器。滞后窗口压住的尾巴必须在本次调用
+      // 结束时放出 —— 无论成功还是抛错，否则用户会看到被截断的半句话。
+      const redactor = this.redactorFactory?.();
+      const flushRedactor = (): void => {
+        if (!redactor) return;
+        const rest = redactor.flush();
+        if (rest) this.emit({ type: 'delta', text: rest });
+      };
       try {
         // 中间件本轮追加的 system 上下文（画像/意图/路由说明）拼在基础提示词之后
         const systemPrompt =
@@ -155,9 +171,21 @@ export class AgentLoop {
           systemPrompt,
           this.conversationMessages,
           visibleTools,
-          { onDelta: (text) => this.emit({ type: 'delta', text }) }
+          {
+            onDelta: (text) => {
+              if (!redactor) {
+                this.emit({ type: 'delta', text });
+                return;
+              }
+              // 只放出「已确认不会与后续内容拼成敏感串」的部分，可能是空串
+              const safe = redactor.feed(text);
+              if (safe) this.emit({ type: 'delta', text: safe });
+            },
+          }
         );
+        flushRedactor();
       } catch (err: any) {
+        flushRedactor();
         const errorMsg = `LLM调用失败: ${err.message}`;
         this.emit({ type: 'error', error: errorMsg });
         this.emitDone();
