@@ -73,6 +73,8 @@ export interface CostRecord {
   costUsd: number;
   model: string;
   timestamp: number;
+  /** 定价是否精确命中窗口；非 exact 的记录在对账时应被筛出复核（v0.4） */
+  pricingResolved: 'exact' | 'before-first' | 'after-last' | 'unknown-model';
 }
 
 // Agent config

@@ -1,4 +1,9 @@
-import { TokenTracker, resolvePricing } from '../src/core/token-tracker.js';
+import {
+  TokenTracker,
+  resolvePricing,
+  resolveFromWindows,
+  validatePriceWindows,
+} from '../src/core/token-tracker.js';
 import type { TokenUsage } from '../src/core/types.js';
 
 const MODEL = 'claude-sonnet-4-20250514';
@@ -155,6 +160,95 @@ describe('TokenTracker', () => {
       tracker.add(ONE_M, 'claude-sonnet-5', IN_INTRO);
       tracker.add(ONE_M, 'claude-sonnet-5', AFTER_INTRO);
       expect(tracker.getTotalCost()).toBeCloseTo(30); // 12 + 18
+    });
+  });
+
+  // ============ v0.4：承接 v0.3 评审的三项 ============
+  describe('价格窗口回退方向（v0.3 的注释与代码方向相反）', () => {
+    const W = [
+      { from: '2026-03-01', until: '2026-05-31', input: 1, output: 2 },
+      { from: '2026-06-01', until: '2026-08-31', input: 3, output: 4 },
+      { from: '2026-09-01', input: 5, output: 6 },
+    ];
+    const at = (d: string) => Date.parse(`${d}T12:00:00Z`);
+
+    it('命中窗口 → exact', () => {
+      expect(resolveFromWindows(W, at('2026-07-01'))).toMatchObject({
+        input: 3,
+        resolved: 'exact',
+      });
+    });
+
+    it('早于所有窗口 → 用最早窗口，标记 before-first（v0.3 会错用最未来的价格算历史账）', () => {
+      expect(resolveFromWindows(W, at('2026-01-01'))).toMatchObject({
+        input: 1,
+        output: 2,
+        resolved: 'before-first',
+      });
+    });
+
+    it('晚于所有窗口 → 用最晚窗口，标记 after-last', () => {
+      const closed = [{ from: '2026-03-01', until: '2026-05-31', input: 1, output: 2 }];
+      expect(resolveFromWindows(closed, at('2026-12-01'))).toMatchObject({
+        input: 1,
+        resolved: 'after-last',
+      });
+    });
+
+    it('未知型号 → unknown-model，可在对账时筛出', () => {
+      expect(resolvePricing('no-such-model', Date.now()).resolved).toBe('unknown-model');
+    });
+
+    it('CostRecord 带上解析方式（非 exact 的记录应被复核）', () => {
+      expect(tracker.add({ inputTokens: 1, outputTokens: 1 }, 'claude-opus-5').pricingResolved).toBe('exact');
+      expect(tracker.add({ inputTokens: 1, outputTokens: 1 }, 'no-such-model').pricingResolved).toBe('unknown-model');
+    });
+  });
+
+  describe('价格窗口一致性校验（v0.3 只有注释约束，无人执行）', () => {
+    it('合法窗口通过', () => {
+      expect(() =>
+        validatePriceWindows('m', [
+          { until: '2026-08-31', input: 2, output: 10 },
+          { from: '2026-09-01', input: 3, output: 15 },
+        ])
+      ).not.toThrow();
+    });
+
+    it('重叠窗口抛错（录错必须是吵的，不能静默取先列的那个）', () => {
+      expect(() =>
+        validatePriceWindows('m', [
+          { until: '2026-08-31', input: 2, output: 10 },
+          { from: '2026-08-15', input: 3, output: 15 },
+        ])
+      ).toThrow(/重叠/);
+    });
+
+    it('有缝隙的窗口抛错', () => {
+      expect(() =>
+        validatePriceWindows('m', [
+          { until: '2026-08-31', input: 2, output: 10 },
+          { from: '2026-09-05', input: 3, output: 15 },
+        ])
+      ).toThrow(/缝隙/);
+    });
+
+    it('非首个窗口省略 from 抛错', () => {
+      expect(() =>
+        validatePriceWindows('m', [
+          { until: '2026-08-31', input: 2, output: 10 },
+          { input: 3, output: 15 },
+        ])
+      ).toThrow(/只有第一个窗口/);
+    });
+
+    it('空窗口抛错', () => {
+      expect(() => validatePriceWindows('m', [])).toThrow(/不能为空/);
+    });
+
+    it('内置价格表全部通过校验（模块加载时已执行，这里再显式断言一次）', () => {
+      // 若内置表录错，token-tracker.js 在 import 时就会 throw，本文件根本跑不到这里
+      expect(resolvePricing('claude-sonnet-5', Date.parse('2026-08-20T00:00:00Z')).resolved).toBe('exact');
     });
   });
 

@@ -11,13 +11,26 @@ import type { TokenUsage, CostRecord } from './types.js';
  * 因此定价按「调用发生的时刻」解析，而不是按「当前时刻」。
  */
 export interface PriceWindow {
-  /** 生效起（含），`YYYY-MM-DD`；省略表示「自始」 */
+  /**
+   * 生效起（含），`YYYY-MM-DD`；省略表示「自始」。
+   * ⚠️ **边界按 UTC 日期判定**（`toISOString().slice(0,10)`）。
+   * 若某型号的限时定价按厂商本地时区截止，切换当天最多有 ≤8 小时的口径差；
+   * 这是显式契约，不是疏漏 —— v0.11 对账时按此口径解释差异。
+   */
   from?: string;
-  /** 生效止（含），`YYYY-MM-DD`；省略表示「至今」 */
+  /** 生效止（含），`YYYY-MM-DD`；省略表示「至今」。边界同样按 UTC 日期判定。 */
   until?: string;
   input: number;
   output: number;
 }
+
+/**
+ * 定价解析结果。`resolved` 让「非精确命中」可被识别 ——
+ * v0.3 的实现在未命中时静默取最后一个窗口，对账时无法筛出这类记录。
+ */
+export type PricingResolution = PriceWindow & {
+  resolved: 'exact' | 'before-first' | 'after-last' | 'unknown-model';
+};
 
 /** 价格表。同一型号的多个窗口按时间先后排列，区间不应重叠。 */
 const MODEL_PRICING: Record<string, PriceWindow[]> = {
@@ -50,21 +63,89 @@ function toDayString(at: number): string {
   return new Date(at).toISOString().slice(0, 10);
 }
 
-/**
- * 解析某型号在某时刻的适用价格。
- * 导出以便单测直接断言「引入期内外拿到不同价格」。
- */
-export function resolvePricing(model: string, at: number): PriceWindow {
-  const windows = MODEL_PRICING[model];
-  if (!windows || windows.length === 0) return DEFAULT_PRICING;
+function nextDay(day: string): string {
+  const t = Date.parse(`${day}T00:00:00Z`) + 86_400_000;
+  return new Date(t).toISOString().slice(0, 10);
+}
 
+/**
+ * 校验一个型号的价格窗口：按时间有序、无重叠、无缝隙。
+ *
+ * 为什么要 throw 而不是容忍：计费表的「未命中」必须是**吵**的。
+ * v0.3 的注释写了「区间不应重叠」，但没有任何东西保证它 ——
+ * `.find()` 取第一个匹配，手写录错成重叠时会静默取先列的那个，
+ * 而计费口径一旦静默漂移，v0.11 的多租户账本就对不上账且查不出原因。
+ */
+export function validatePriceWindows(model: string, windows: PriceWindow[]): void {
+  if (windows.length === 0) {
+    throw new Error(`[pricing] ${model}: 价格窗口不能为空`);
+  }
+
+  windows.forEach((w, i) => {
+    if (i > 0 && !w.from) {
+      throw new Error(`[pricing] ${model}: 只有第一个窗口可以省略 from（第 ${i + 1} 个省略了）`);
+    }
+    if (i < windows.length - 1 && !w.until) {
+      throw new Error(`[pricing] ${model}: 只有最后一个窗口可以省略 until（第 ${i + 1} 个省略了）`);
+    }
+    if (w.from && w.until && w.from > w.until) {
+      throw new Error(`[pricing] ${model}: 第 ${i + 1} 个窗口 from(${w.from}) 晚于 until(${w.until})`);
+    }
+    if (i > 0) {
+      const prev = windows[i - 1];
+      const expected = nextDay(prev.until!);
+      if (w.from! < expected) {
+        throw new Error(
+          `[pricing] ${model}: 第 ${i} 与第 ${i + 1} 个窗口重叠（${prev.until} → ${w.from}）`
+        );
+      }
+      if (w.from! > expected) {
+        throw new Error(
+          `[pricing] ${model}: 第 ${i} 与第 ${i + 1} 个窗口之间有缝隙（${prev.until} → ${w.from}，缺 ${expected}）`
+        );
+      }
+    }
+  });
+}
+
+/**
+ * 从给定窗口集解析某时刻的价格（纯函数，便于直接单测任意窗口组合）。
+ *
+ * v0.4 修正 v0.3 的回退方向：原实现注释说「调用发生在更早」，代码却回退到
+ * `windows[windows.length - 1]`（最未来的窗口）—— 方向是反的，
+ * 会用未来的价格去算历史账。现在两端分别回退，且回退可被识别。
+ */
+export function resolveFromWindows(
+  windows: PriceWindow[],
+  at: number
+): PricingResolution {
   const day = toDayString(at);
+
   const hit = windows.find(
     (w) => (!w.from || day >= w.from) && (!w.until || day <= w.until)
   );
+  if (hit) return { ...hit, resolved: 'exact' };
 
-  // 落在所有窗口之外（例如型号新增了未来窗口而调用发生在更早）→ 用最后一个窗口
-  return hit ?? windows[windows.length - 1];
+  // 早于所有窗口 → 用**最早**窗口；晚于所有窗口 → 用**最晚**窗口
+  const first = windows[0];
+  if (first.from && day < first.from) {
+    return { ...first, resolved: 'before-first' };
+  }
+  return { ...windows[windows.length - 1], resolved: 'after-last' };
+}
+
+/** 解析某型号在某时刻的适用价格。 */
+export function resolvePricing(model: string, at: number): PricingResolution {
+  const windows = MODEL_PRICING[model];
+  if (!windows || windows.length === 0) {
+    return { ...DEFAULT_PRICING, resolved: 'unknown-model' };
+  }
+  return resolveFromWindows(windows, at);
+}
+
+// 模块加载即校验全表：录错的价格表不该等到某次计费才暴露
+for (const [model, windows] of Object.entries(MODEL_PRICING)) {
+  validatePriceWindows(model, windows);
 }
 
 export class TokenTracker {
@@ -98,6 +179,7 @@ export class TokenTracker {
       costUsd,
       model,
       timestamp: at,
+      pricingResolved: pricing.resolved,
     };
 
     this.records.push(record);
