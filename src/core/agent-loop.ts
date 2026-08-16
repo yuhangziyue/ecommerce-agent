@@ -12,6 +12,7 @@ import {
 } from '../tools/gateway.js';
 import type { TrajectoryLogger } from '../evaluation/trajectory-logger.js';
 import type { StreamingRedactor } from '../safety/streaming-redactor.js';
+import type { Span, Tracer } from '../observability/tracing.js';
 import type {
   AgentConfig,
   AgentEvent,
@@ -21,6 +22,7 @@ import type {
   Message,
   ToolResult,
   ToolUse,
+  TurnResult,
 } from './types.js';
 
 /**
@@ -101,6 +103,10 @@ export interface AgentLoopDeps {
   onUsage?: (record: CostRecord) => void | Promise<void>;
   /** v0.15：跨进程链路号。HTTP 层从请求头取或新建，一路透传到工具服务 */
   traceId?: string;
+  /** v1.2：注入后每次模型调用产出一个 span。不传则完全不埋点 */
+  tracer?: Tracer;
+  /** 本轮的父 span（HTTP 层建的） */
+  parentSpan?: Span;
   /**
    * v1.0：取消信号。缺省不传时行为与 v0.15 完全一致 ——
    * 这是刻意的：取消能力不该改变没有取消时的语义。
@@ -121,6 +127,8 @@ export class AgentLoop {
   private readonly onUsage?: (record: CostRecord) => void | Promise<void>;
   /** v0.15：本轮链路号。由调用方给，缺省自生成 */
   private readonly traceId: string;
+  private readonly tracer?: Tracer;
+  private readonly parentSpan?: Span;
   private readonly signal?: AbortSignal;
   private conversationMessages: Message[] = [];
 
@@ -139,6 +147,8 @@ export class AgentLoop {
     this.redactorFactory = deps.redactor;
     this.onUsage = deps.onUsage;
     this.traceId = deps.traceId ?? newTraceId();
+    this.tracer = deps.tracer;
+    this.parentSpan = deps.parentSpan;
     this.signal = deps.signal;
 
     // v0.4：事件分发收敛到总线。`onEvent` 与 `trajectory` 从「Loop 的两套并行机制」
@@ -158,7 +168,13 @@ export class AgentLoop {
     }
   }
 
-  async run(userInput: string): Promise<string> {
+  /**
+   * 跑一轮对话。
+   *
+   * v1.2 起返回 `TurnResult` 而不是字符串。理由见 `TurnResult` 的注释：
+   * 失败时把错误正文当回复返回，调用方就只能靠字符串匹配判断成败。
+   */
+  async run(userInput: string): Promise<TurnResult> {
     const ctx: TurnContext = {
       sessionId: this.session.getId(),
       userInput,
@@ -207,6 +223,13 @@ export class AgentLoop {
         const rest = redactor.flush();
         if (rest) this.emit({ type: 'delta', text: rest });
       };
+      // v1.2：每次模型调用一个 span。**这是最值得埋的一段** ——
+      // 一次请求的墙钟时间九成在这里，而它还会重复 N 轮
+      const modelSpan = this.tracer?.startSpan('model.chat', {
+        parent: this.parentSpan,
+        traceId: this.traceId,
+        attributes: { model: this.config.model, turn: turns },
+      });
       try {
         // 中间件本轮追加的 system 上下文（画像/意图/路由说明）拼在基础提示词之后
         const systemPrompt =
@@ -239,16 +262,29 @@ export class AgentLoop {
           }
         );
         flushRedactor();
+        modelSpan?.end();
       } catch (err: any) {
         flushRedactor();
+        modelSpan?.recordError(err).end();
         // 取消不是错误 —— 客户端断开导致的中止不该进错误率
         if (this.signal?.aborted || err?.name === 'AbortError') {
           return this.cancelTurn();
         }
         const errorMsg = `LLM调用失败: ${err.message}`;
-        this.emit({ type: 'error', error: errorMsg });
+        this.emit({
+          type: 'error',
+          error: errorMsg,
+          code: 'model_error',
+          retryable: true,
+        });
         this.emitDone();
-        return errorMsg;
+        // reply 是空串：这句话是**诊断信息**，不是客服的回答。
+        // v0.1~v1.1 把它当回复返回，于是 CLI 直接打给用户看
+        return {
+          reply: '',
+          outcome: 'error',
+          error: { code: 'model_error', message: errorMsg, retryable: true },
+        };
       }
 
       const costRecord = this.tracker.add(response.usage, this.config.model);
@@ -292,9 +328,19 @@ export class AgentLoop {
     }
 
     const maxTurnMsg = `已达到最大交互轮次(${this.config.maxTurns})，请简化您的问题或开启新会话。`;
-    this.emit({ type: 'error', error: maxTurnMsg });
+    this.emit({
+      type: 'error',
+      error: maxTurnMsg,
+      code: 'max_turns',
+      // 同样的问题再问一次大概率还是不收敛 —— 要变的是问题，不是重试次数
+      retryable: false,
+    });
     this.emitDone();
-    return maxTurnMsg;
+    return {
+      reply: '',
+      outcome: 'max_turns',
+      error: { code: 'max_turns', message: maxTurnMsg, retryable: false },
+    };
   }
 
   /**
@@ -384,6 +430,14 @@ export class AgentLoop {
         });
 
         const startTime = Date.now();
+        // v1.2：工具执行一个 span。远程形态下 tool-service 会用 traceparent
+        // 再挂一个子 span —— 于是「网络往返」与「工具真正跑了多久」能分开看，
+        // 而这两者混在一起时，慢的到底是网络还是工具是猜不出来的
+        const toolSpan = this.tracer?.startSpan('tool.execute', {
+          parent: this.parentSpan,
+          traceId: this.traceId,
+          attributes: { tool: plan.toolUse.name },
+        });
         let result: ToolResult;
         try {
           result = await this.tools.execute(plan.toolUse.name, plan.toolUse.input, {
@@ -391,11 +445,15 @@ export class AgentLoop {
             userId: this.session.getUserId(),
             tenantId: this.session.getTenantId(),
             traceId: this.traceId,
+            spanId: toolSpan?.spanId,
             signal: this.signal,
           });
+          if (result.isError) toolSpan?.setAttribute('tool.error', true);
         } catch (err: any) {
           result = { content: `工具执行出错: ${err.message}`, isError: true };
+          toolSpan?.recordError(err);
         }
+        toolSpan?.end();
         plan.durationMs = Date.now() - startTime;
 
         this.emit({
@@ -433,7 +491,7 @@ export class AgentLoop {
     ctx: TurnContext,
     rawReply: string,
     toolsUsed: string[]
-  ): Promise<string> {
+  ): Promise<TurnResult> {
     const post = await this.pipeline.runAfterTurn(ctx, rawReply);
     if (post.blocked) {
       return this.blockTurn(post.blocked.by, post.blocked.reason);
@@ -460,15 +518,26 @@ export class AgentLoop {
 
     this.emit({ type: 'response', content: reply });
     this.emitDone();
-    return reply;
+    return { reply, outcome: 'ok' };
   }
 
   /** 被中间件拦截：emit blocked + done（终端事件必须成对，v0.6 SSE 依赖这个保证） */
-  private async blockTurn(by: string, reason: string): Promise<string> {
+  private async blockTurn(by: string, reason: string): Promise<TurnResult> {
     this.emit({ type: 'blocked', by, reason });
     await this.session.appendMetadata('blocked', { by, reason });
     this.emitDone();
-    return reason;
+    return {
+      // 拦截理由是**给调用方看的诊断**，不是给终端客户的回复 ——
+      // 把「检测到提示词注入」当成客服的话打给客户，等于告诉攻击者他被发现了
+      reply: '',
+      outcome: 'blocked',
+      error: {
+        code: 'blocked',
+        message: reason,
+        // 重试没用：同一段输入撞的是同一条规则
+        retryable: false,
+      },
+    };
   }
 
   /**
@@ -477,11 +546,13 @@ export class AgentLoop {
    * 不发 `error` 事件、不记错误 —— 用户关掉页面是正常行为，
    * 把它统计成系统错误会让错误率变成一堆噪声，真故障反而看不见了。
    */
-  private cancelTurn(): string {
+  private cancelTurn(): TurnResult {
     const reason = '客户端已断开，本轮已中止';
     this.emit({ type: 'cancelled', reason });
     this.emitDone();
-    return reason;
+    // **不带 error** —— 取消不是错误（v1.0 已定调）。
+    // 给它塞一个 error 会让所有按 error 字段告警的地方在用户关页面时炸
+    return { reply: '', outcome: 'cancelled' };
   }
 
   private async pushToolResult(

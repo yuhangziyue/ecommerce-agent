@@ -109,4 +109,11 @@ export interface IdempotencyStore {
   }): Promise<void>;
   /** 执行失败时释放占位，否则调用方要等到 TTL 才能重试 */
   release(key: string, keyId: string): Promise<void>;
+  /**
+   * 删除已过期的记录，返回删除条数（v1.2）。
+   *
+   * `limit` 是硬要求不是优化：一次 DELETE 扫全表会长时间持锁，
+   * 而这张表同时是幂等占位的热点表。宁可多跑几轮。
+   */
+  purgeExpired(now: number, limit: number): Promise<number>;
 }

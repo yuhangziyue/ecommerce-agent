@@ -2,11 +2,11 @@
 
 一个电商场景的对话式 AI 客服服务。**对外提供 HTTP/SSE 接口**，不是命令行玩具。
 
-从 v0.1 到 v1.1 走了 16 个版本，每版都有 SPEC / PLAN / REPORT 存档在
+从 v0.1 到 v1.2 走了 17 个版本，每版都有 SPEC / PLAN / REPORT 存档在
 [`docs/iterations/`](docs/iterations/)，总路线见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。
 
 ```
-738 个用例 ｜ npm run verify exit 0 ｜ 离线评测 15/15 ｜ 三维回归门守着质量·成本·延迟
+795 个用例 ｜ npm run verify exit 0 ｜ 离线评测 15/15 ｜ 三维回归门守着质量·成本·延迟
 ```
 
 ---
@@ -27,7 +27,9 @@
 | **多租户** | 账本、配额、售后政策、安全规则、**用户画像**均按租户隔离（规则只能加严） |
 | **身份与边界** | API Key 认证（存哈希）+ scope + **租户只从凭证取** + 越权一律 404 |
 | **防滥用** | 按凭证限流（429 + Retry-After）+ `Idempotency-Key`（重发不会重复退款） |
-| **可观测** | Prometheus `/metrics` + 离线评测集 + 三维回归门 |
+| **可观测** | Prometheus `/metrics` + **分布式追踪**（自研 span + OTLP 导出 + W3C traceparent）+ 离线评测集 + 三维回归门 |
+| **明确的失败** | 轮次结果分 `ok/blocked/cancelled/error/max_turns`，带 `retryable`；**失败时 reply 是空串**，错误正文不冒充回复 |
+| **会话一致性** | 会话独占锁，同一会话并发的第二轮 409 而不是把历史写交错 |
 | **韧性** | 熔断 + 重试（高风险工具永不重试）+ 取消传播 + 优雅退出 |
 | **可拆分** | 工具执行可作为独立服务，两种形态行为一致 |
 
@@ -89,6 +91,7 @@ SSE 事件：`session` / `intent` / `routing` / `safety` / `delta` / `thinking` 
 | `GET` · `PUT /v1/tenants/:id/config` · `GET /v1/tenants/:id/usage` | 租户配置与用量 |
 | `GET /v1/users/:id/profile` | 用户画像（长期记忆） |
 | `GET /v1/agents` | 领域 Agent 列表 |
+| `GET /v1/traces/:trace_id` | 本实例的链路 span（没有 collector 时也能看） |
 | `GET /metrics` · `/healthz` | 指标、健康检查（**免认证**，不返回任何租户数据） |
 
 权限：`chat` 发起对话 · `read` 读 · `write` 决策确认单/改配置 · `admin` 跨租户（运营后台）。
@@ -136,6 +139,7 @@ SSE 事件：`session` / `intent` / `routing` / `safety` / `delta` / `thinking` 
 | `src/evaluation/` | 评测用例、判定逻辑、回归门 |
 | `src/resilience/` | 熔断器与重试 |
 | `src/auth/` | Principal、API Key 生成与哈希 |
+| `src/observability/tracing.ts` | Span / Tracer / OTLP 导出 / W3C traceparent |
 | `src/tool-service/` | 独立工具服务 |
 
 ## 部署
@@ -174,6 +178,9 @@ SSE 事件：`session` / `intent` / `routing` / `safety` / `delta` / `thinking` 
 | v1.1 | **`tenant_id` 由客户端声明** —— 多租户做了五个版本，租户身份却是请求体里的一个字符串 |
 | v1.1 | 画像主键是 `user_id` 单列 —— 而 user_id 常是手机号，任何租户拿它就能读到别家客户的偏好与投诉记录 |
 | v1.1 | 拆分形态下 `tool-service` 裸奔 —— 绕过主服务直接打它，v0.12 的高危确认流根本不存在 |
+| v1.2 | `run()` 失败时把 `LLM调用失败: xxx` **当回复正文返回** —— CLI 逐字打给用户看 |
+| v1.2 | 会话并发不是"覆盖写"而是**消息交错** —— 下一轮 restore 出来的历史直接是坏的，且延迟一轮才发作 |
+| v1.2 | `/v1/traces` 归属判定第一版按「逐 span 过滤」，而 model/tool span 根本没有 tenant 属性 —— **默认放行 + 逐项排除，在数据缺失时会静默放行** |
 
 共同点：**单元测试全绿，端到端行为是错的。** 抓住它们的唯一办法，
 是沿着用户真实走的那条路从头跑一遍，并且**先把失效的样子固定成用例**再动手修。

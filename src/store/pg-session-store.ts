@@ -91,6 +91,33 @@ export class PgSessionStore implements SessionStore {
     return rows.map(toRecord);
   }
 
+  /**
+   * 独占本会话的一轮（v1.2）。
+   *
+   * **compare-and-set 而不是「先查再写」**：后者在并发下两个请求会同时查到
+   * 「没锁」、同时认为自己拿到了 —— 而这个锁存在的全部意义就是应付并发。
+   *
+   * `WHERE turn_locked_until IS NULL OR turn_locked_until < $2` 让过期锁可被抢走：
+   * 上一个持有者的进程崩了，不该把这条会话永久钉死。
+   */
+  async acquireTurnLock(sessionId: string, ttlMs: number, now: number): Promise<boolean> {
+    const { rows } = await this.db.query<{ id: string }>(
+      `UPDATE sessions
+          SET turn_locked_until = $3
+        WHERE id = $1
+          AND (turn_locked_until IS NULL OR turn_locked_until < $2)
+        RETURNING id`,
+      [sessionId, new Date(now).toISOString(), new Date(now + ttlMs).toISOString()]
+    );
+    return rows.length > 0;
+  }
+
+  async releaseTurnLock(sessionId: string): Promise<void> {
+    await this.db.query('UPDATE sessions SET turn_locked_until = NULL WHERE id = $1', [
+      sessionId,
+    ]);
+  }
+
   async appendEntry(sessionId: string, entry: SessionEntry): Promise<void> {
     // 单条 INSERT 就是原子的 —— 不会像 appendFileSync 那样交错出半行。
     // 顺便刷新 updated_at，便于「最近活跃会话」这类查询。

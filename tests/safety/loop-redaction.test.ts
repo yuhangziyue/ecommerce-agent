@@ -91,7 +91,7 @@ describe('AgentLoop 流式脱敏（v0.10 · 还 v0.4 的账）', () => {
         : undefined,
     });
 
-    const reply = await loop.run('客服电话是多少');
+    const { reply: reply } = await loop.run('客服电话是多少');
     const streamed = events
       .filter((e) => e.type === 'delta')
       .map((e) => (e as { text: string }).text)

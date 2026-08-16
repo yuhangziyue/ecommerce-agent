@@ -52,6 +52,15 @@ export interface SessionStore {
   listByUser(userId: string, limit?: number): Promise<SessionRecord[]>;
   listByTenant(tenantId: string, limit?: number): Promise<SessionRecord[]>;
   appendEntry(sessionId: string, entry: SessionEntry): Promise<void>;
+  /**
+   * 尝试独占这个会话（v1.2）。拿不到返回 false —— **不排队**。
+   *
+   * 排队意味着第二个请求要挂着等一次完整的模型调用（秒级），连接被占住，
+   * 而调用方并不知道自己在排队。同一段对话同时说两句话本身就不是合法用法，
+   * 与其猜他想要什么，不如明确告诉他。
+   */
+  acquireTurnLock(sessionId: string, ttlMs: number, now: number): Promise<boolean>;
+  releaseTurnLock(sessionId: string): Promise<void>;
   /** 按追加顺序（seq）返回，不依赖时间戳 —— 并发写入下时间戳可能相同 */
   getEntries(sessionId: string): Promise<SessionEntry[]>;
 }

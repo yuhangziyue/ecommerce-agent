@@ -268,6 +268,21 @@ ALTER TABLE user_profiles DROP CONSTRAINT IF EXISTS user_profiles_pkey;
 ALTER TABLE user_profiles ADD PRIMARY KEY (tenant_id, user_id);
 `,
   },
+  {
+    // v1.2 会话独占锁。
+    //
+    // 会话是**追加式**的，所以并发不会覆盖数据 —— 它造成的是更隐蔽的问题：
+    // 两个请求各自 restore 一份快照、各自往同一条会话追加，
+    // 消息顺序交错，`tool_use` 与产生它的 `tool_result` 被别的消息隔开。
+    // 而 v0.3 的投影逻辑对顺序敏感 —— 下一轮 restore 出来的历史直接是坏的。
+    //
+    // 存到期时间而不是布尔量：进程崩了不会把会话永久钉死
+    //（与 v1.1 幂等占位同一个模式）。
+    name: '011_session_turn_lock',
+    sql: `
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS turn_locked_until TIMESTAMPTZ;
+`,
+  },
 ];
 
 /**

@@ -141,6 +141,20 @@ export class CachedSessionStore implements SessionStore {
     await this.cache.invalidate(sessionId);
   }
 
+  /**
+   * 锁**不经过缓存**，直接打库（v1.2）。
+   *
+   * 缓存的第一原则是「它是加速，不是依赖」；而锁恰恰是不能被降级的东西 ——
+   * 一个允许 miss 的锁不是锁。
+   */
+  acquireTurnLock(sessionId: string, ttlMs: number, now: number): Promise<boolean> {
+    return this.inner.acquireTurnLock(sessionId, ttlMs, now);
+  }
+
+  releaseTurnLock(sessionId: string): Promise<void> {
+    return this.inner.releaseTurnLock(sessionId);
+  }
+
   async getEntries(sessionId: string): Promise<SessionEntry[]> {
     const cached = await this.cache.get(sessionId);
     if (cached) return cached;

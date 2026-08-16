@@ -89,3 +89,16 @@ docker compose exec agent-service npm run key:issue -- --revoke key_xxxx
 
 限流有 `REDIS_URL` 时全局准确；没有则降级为**进程内令牌桶**——
 多实例下配额是 N 倍。当前档位在 `/healthz` 的 `rate_limit` 字段里看得到。
+
+## v1.2 · 追踪与清理的环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `AGENT_OTLP_ENDPOINT` | 未设 | OTLP/HTTP collector 地址（如 `http://otel-collector:4318/v1/traces`）。**不设也有追踪** —— 走内存缓冲，`GET /v1/traces/:id` 可查 |
+| `AGENT_TRACE_BUFFER` | `2000` | 内存环形缓冲的 span 上限 |
+| `AGENT_TURN_LOCK_TTL_MS` | `60000` | 会话独占锁的 TTL。正常路径在请求结束时立刻释放，TTL 只是进程崩溃的兜底 |
+| `AGENT_SWEEP_INTERVAL_MS` | `600000` | 过期幂等记录的清理周期。设 `0` 关闭 |
+
+> ⚠️ `GET /v1/traces/:id` 读的是**本实例**的内存缓冲。多实例部署下只能看到打到那台机器的部分 ——
+> 要全局查询就接 collector（OTLP 已经通了）。这个接口的定位是「没有 collector 时也能看链路」，
+> 不是替代 collector。

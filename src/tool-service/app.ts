@@ -7,6 +7,7 @@ import { buildReturnFlow, DEFAULT_RETURN_POLICY } from '../flows/return-flow.js'
 import { MetricsRegistry } from '../observability/metrics.js';
 import type { Stores } from '../store/index.js';
 import { safeEqual, parseBearer } from '../auth/api-key.js';
+import { parseTraceparent, Tracer } from '../observability/tracing.js';
 import type { ToolContext } from '../core/types.js';
 
 /**
@@ -27,6 +28,8 @@ export interface ToolServiceOptions {
    * 没有多租户、没有 scope —— 引入一整套密钥体系是过度设计。
    */
   authToken?: string;
+  /** v1.2：注入后每次工具执行产出一个 span，并接住上游的 traceparent */
+  tracer?: Tracer;
 }
 
 export const TOOL_SERVICE_OPEN_WARNING =
@@ -45,6 +48,10 @@ const EXECUTE_SCHEMA = {
         userId: { type: ['string', 'null'] },
         tenantId: { type: ['string', 'null'] },
         traceId: { type: 'string' },
+        // v1.2：调用方那一侧的 span id。**必须显式列出** ——
+        // additionalProperties:false 是刻意的（拼写错误要在边界报 400），
+        // 代价就是每加一个上下文字段都要来这里同步一次
+        spanId: { type: 'string' },
       },
       additionalProperties: false,
     },
@@ -112,9 +119,20 @@ export async function buildToolService(
         (request.headers['x-trace-id'] as string | undefined) ?? context?.traceId;
       const spanId = request.headers['x-span-id'] as string | undefined;
 
+      // v1.2：接住上游的 traceparent，把本进程的 span 挂到调用方的 span 下面。
+      // **这是「跨进程」三个字的全部含义** —— 没有它，拆开之后两边各有一堆
+      // 互不相干的 span，谁也说不清一次请求到底经过了什么
+      const upstream = parseTraceparent(request.headers.traceparent as string | undefined);
+      const span = opts.tracer?.startSpan('tool.service.execute', {
+        traceId: upstream?.traceId ?? traceId,
+        parentSpanId: upstream?.spanId,
+        attributes: { tool: name },
+      });
+
       const tool = registry.get(name);
       if (!tool) {
         execCount.inc({ tool: name, status: 'not_found' });
+        span?.recordError(new Error(`工具 ${name} 不存在`)).end();
         return reply
           .status(404)
           .send({ error: { code: 'tool_not_found', message: `工具 ${name} 不存在` } });
@@ -125,6 +143,7 @@ export async function buildToolService(
       const validation = registry.validate(name, input);
       if (!validation.ok) {
         execCount.inc({ tool: name, status: 'invalid' });
+        span?.recordError(new Error(validation.error)).end();
         return reply.status(400).send({
           error: { code: 'invalid_params', message: validation.error },
         });
@@ -142,6 +161,9 @@ export async function buildToolService(
 
         execCount.inc({ tool: name, status: result.isError ? 'error' : 'ok' });
         execDuration.observe(durationMs / 1000, { tool: name });
+        span?.setAttribute('duration_ms', durationMs);
+        if (result.isError) span?.setAttribute('tool.error', true);
+        span?.end();
 
         if (opts.logger) {
           request.log.info({ traceId, spanId, tool: name, durationMs }, '工具执行完成');
@@ -150,6 +172,7 @@ export async function buildToolService(
         return reply.send({ result, trace_id: traceId ?? null, duration_ms: durationMs });
       } catch (err) {
         execCount.inc({ tool: name, status: 'throw' });
+        span?.recordError(err).end();
         // 工具抛异常是**工具的问题**，用 200 + isError 返回而不是 5xx ——
         // 5xx 会让调用侧当成「服务不可用」并触发重试，而重试一个必然失败的调用没有意义
         return reply.send({

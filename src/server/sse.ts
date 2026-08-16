@@ -49,7 +49,13 @@ export function agentEventToSse(event: AgentEvent): string {
     case 'blocked':
       return frame('blocked', { by: event.by, reason: event.reason });
     case 'error':
-      return frame('error', { message: event.error });
+      // v1.2：带上机器可读的分类与 retryable。
+      // 只发一句中文的话，客户端要判断「该不该重试」只能做字符串匹配
+      return frame('error', {
+        message: event.error,
+        code: event.code,
+        retryable: event.retryable,
+      });
     case 'done':
       return frame('done', {
         input_tokens: event.totalTokens.inputTokens,

@@ -27,6 +27,9 @@ class CountingStore implements SessionStore {
   listByUser = (u: string, l?: number) => this.inner.listByUser(u, l);
   listByTenant = (t: string, l?: number) => this.inner.listByTenant(t, l);
   appendEntry = (s: string, e: SessionEntry) => this.inner.appendEntry(s, e);
+  acquireTurnLock = (s: string, ttl: number, now: number) =>
+    this.inner.acquireTurnLock(s, ttl, now);
+  releaseTurnLock = (s: string) => this.inner.releaseTurnLock(s);
   getEntries(sessionId: string) {
     this.getEntriesCalls++;
     return this.inner.getEntries(sessionId);

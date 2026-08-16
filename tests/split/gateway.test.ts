@@ -373,7 +373,7 @@ describe('🔴 远程故障的错误语义（基础设施故障 ≠ 业务结论
     expect(listCalls).toBe(2);
   });
 
-  it('🔴 traceId 与 spanId 进请求头（不然链路串不起来）', async () => {
+  it('🔴 traceparent 与 traceId 进请求头（不然链路串不起来）', async () => {
     let seen: Record<string, string> | undefined;
     const gw = failing(async ({ path, headers }) => {
       if (path === '/v1/tools') return okList();
@@ -381,9 +381,29 @@ describe('🔴 远程故障的错误语义（基础设施故障 ≠ 业务结论
       return { status: 200, body: JSON.stringify({ result: { content: 'ok' } }) };
     });
 
-    await gw.execute('order_lookup', { orderId: 'X' }, ctx);
-    expect(seen!['x-trace-id']).toBe('tr_x');
-    expect(seen!['x-span-id']).toMatch(/^sp_/);
+    const traceId = 'a'.repeat(32);
+    const spanId = 'b'.repeat(16);
+    await gw.execute('order_lookup', { orderId: 'X' }, { ...ctx, traceId, spanId });
+
+    expect(seen!['x-trace-id']).toBe(traceId);
+    // v1.2：W3C 标准头 —— 工具服务据此把自己的 span 挂到调用方的 span 下面。
+    // 自造格式等于把链路锁死在自家生态里
+    expect(seen!['traceparent']).toBe(`00-${traceId}-${spanId}-01`);
+    expect(seen!['x-span-id']).toBe(spanId);
+  });
+
+  it('🔴 没有 spanId 时不发畸形的 traceparent', async () => {
+    let seen: Record<string, string> | undefined;
+    const gw = failing(async ({ path, headers }) => {
+      if (path === '/v1/tools') return okList();
+      seen = headers as Record<string, string>;
+      return { status: 200, body: JSON.stringify({ result: { content: 'ok' } }) };
+    });
+
+    // 拼一个半截的 traceparent 比不发更糟：下游解析失败，链路照样断，
+    // 但排查的人会以为传播已经做了
+    await gw.execute('order_lookup', { orderId: 'X' }, { sessionId: 's1', traceId: 'a'.repeat(32) });
+    expect(seen!['traceparent']).toBeUndefined();
   });
 });
 

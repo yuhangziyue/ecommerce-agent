@@ -106,6 +106,27 @@ export class PgIdempotencyStore implements IdempotencyStore {
   }
 
   /**
+   * 清理过期记录。
+   *
+   * 判据只有 `expires_at` 一个 —— **不看 status**：
+   * 已完成的记录同样要在 TTL 之后消失，否则表只增不减。
+   * 而"未过期的已完成记录"是要被重放的资产，绝不能删（由 `expires_at` 天然保护）。
+   */
+  async purgeExpired(now: number, limit: number): Promise<number> {
+    const { rows } = await this.db.query<{ key: string }>(
+      `DELETE FROM idempotency_keys
+        WHERE (key, key_id) IN (
+          SELECT key, key_id FROM idempotency_keys
+           WHERE expires_at < $1
+           LIMIT $2
+        )
+        RETURNING key`,
+      [new Date(now).toISOString(), limit]
+    );
+    return rows.length;
+  }
+
+  /**
    * 释放占位（执行抛异常时用）。
    *
    * 直接删行而不是标记失败：调用方重发时应该**真的重新执行一次**，

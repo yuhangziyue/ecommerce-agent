@@ -71,6 +71,13 @@ import {
   type IdempotentOutcome,
 } from './idempotency.js';
 import { requestFingerprint } from '../auth/api-key.js';
+import { startSweeper } from './sweeper.js';
+import {
+  MemorySpanExporter,
+  parseTraceparent,
+  Tracer,
+  type Span,
+} from '../observability/tracing.js';
 import type { Principal } from '../auth/types.js';
 import type { Stores } from '../store/index.js';
 import type { AgentConfig, AgentEvent, ChatProvider } from '../core/types.js';
@@ -106,7 +113,23 @@ export interface AppOptions {
   rateLimiter?: RateLimiter;
   /** v1.1 幂等键有效期，缺省 24 小时 */
   idempotencyTtlMs?: number;
+  /** v1.2 会话独占锁的 TTL。缺省 60s —— 够长到覆盖一次带工具的完整轮次 */
+  turnLockTtlMs?: number;
+  /** v1.2 追踪。不传则装一个只写内存环形缓冲的 Tracer（`/v1/traces` 可查） */
+  tracer?: Tracer;
+  /** v1.2 内存 span 缓冲。与 tracer 配套注入，供 `/v1/traces/:id` 查询 */
+  spanBuffer?: MemorySpanExporter;
+  /** v1.2 过期幂等记录的清理周期。0 表示不启动 sweeper */
+  sweepIntervalMs?: number;
 }
+
+/**
+ * 会话锁 TTL。
+ *
+ * 取值要够长到覆盖「多轮工具调用 + 模型响应」的最坏情况，
+ * 又要够短到进程崩溃后会话不会长时间不可用。60s 是这两者的折中。
+ */
+export const DEFAULT_TURN_LOCK_TTL_MS = 60_000;
 
 const CHAT_BODY_SCHEMA = {
   type: 'object',
@@ -181,6 +204,21 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
   });
 
   app.addHook('onClose', async () => rateLimiter.close());
+
+  // v1.2：过期幂等记录的清理。缺省 10 分钟一轮 ——
+  // 放在请求路径上"顺手删几条"会把不确定的删除耗时加到每个请求上，
+  // 而且删除量与流量成正比：流量高峰恰恰是最不该做清理的时候
+  const sweeper = startSweeper({
+    store: stores.idempotency,
+    intervalMs: opts.sweepIntervalMs ?? 600_000,
+  });
+  app.decorate('sweeper', sweeper);
+  app.addHook('onClose', async () => sweeper.stop());
+
+  // v1.2 追踪。缺省装一个只写内存的 —— 没有 collector 的环境也能用 /v1/traces 看链路。
+  // 生产接 OTLP 时由 server.ts 注入（见 AGENT_OTLP_ENDPOINT）
+  const spanBuffer = opts.spanBuffer ?? new MemorySpanExporter();
+  const tracer = opts.tracer ?? new Tracer({ exporter: spanBuffer });
 
   // 工具注册表与退款 store 是进程级的，装配一次。
   // v0.15：远程模式下这两样都不需要 —— 工具在 tool-service 里执行，
@@ -329,6 +367,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     principal: Principal,
     traceId: string,
     signal: AbortSignal | undefined,
+    parentSpan: Span | undefined,
     hooks: {
       onIntent?: (state: IntentState) => void;
       onRouted?: (agent: DomainAgent) => void;
@@ -337,7 +376,15 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       onConfirmationRequired?: (c: ConfirmationRecord) => void;
     } = {}
   ): Promise<
-    | { ok: true; session: Session; loop: AgentLoop; bus: EventBus; tracker: TokenTracker }
+    | {
+        ok: true;
+        session: Session;
+        loop: AgentLoop;
+        bus: EventBus;
+        tracker: TokenTracker;
+        /** v1.2：释放会话独占锁。**每条退出路径都必须调它** */
+        release: () => Promise<void>;
+      }
     | { ok: false; status: number; code: string; message: string }
   > {
     // ── v1.1 租户绑定 ──
@@ -382,7 +429,36 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       });
     }
 
-    const resolved = await resolveForTenant(session.getTenantId());
+    // ── v1.2 会话独占 ──
+    //
+    // 会话是追加式的，并发不会覆盖数据 —— 它造成的是更隐蔽的问题：
+    // 两个请求各自 restore 一份快照、各自往同一条会话追加，消息顺序交错，
+    // `tool_use` 与产生它的 `tool_result` 被别的消息隔开。
+    // 而 v0.3 的投影逻辑对顺序敏感 —— 下一轮 restore 出来的历史直接是坏的。
+    const locked = await stores.sessions.acquireTurnLock(
+      session.getId(),
+      opts.turnLockTtlMs ?? DEFAULT_TURN_LOCK_TTL_MS,
+      Date.now()
+    );
+    if (!locked) {
+      return {
+        ok: false,
+        status: 409,
+        code: 'session_busy',
+        // **不排队**：排队意味着调用方挂着等一次完整的模型调用，而他并不知道自己在排队
+        message: `会话 ${session.getId()} 正有一轮对话在进行中，请等它结束后再发`,
+      };
+    }
+    const release = () => stores.sessions.releaseTurnLock(session!.getId());
+
+    let resolved: Awaited<ReturnType<typeof resolveForTenant>>;
+    try {
+      resolved = await resolveForTenant(session.getTenantId());
+    } catch (err) {
+      // 拿了锁之后的任何失败都必须先还锁，否则这条会话要卡满一个 TTL
+      await release().catch(() => {});
+      throw err;
+    }
 
     // ── 配额预检 ──
     // 必须在这里做，而不是只靠管道里的 quota 中间件：SSE 一旦写出响应头就是 200，
@@ -396,6 +472,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       sessionId: session.getId(),
     });
     if (!preflight.allowed && preflight.scope === 'tenant') {
+      await release().catch(() => {});
       return {
         ok: false,
         status: 429,
@@ -413,6 +490,8 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       registry: toolGateway,
       traceId,
       signal,
+      tracer,
+      parentSpan,
       session,
       bus,
       tracker,
@@ -508,7 +587,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       },
     });
 
-    return { ok: true, session, loop, bus, tracker };
+    return { ok: true, session, loop, bus, tracker, release };
   }
 
   // ============ SSE 流式 ============
@@ -521,11 +600,20 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       if (!principal) return reply;
 
       let writer: SseWriter | undefined;
-      const traceId = (request.headers['x-trace-id'] as string) || newTraceId();
+      // v1.2：优先接住上游的 traceparent —— 网关/前端已经开了链路，
+      // 这里另起一条会让同一次用户操作在链路图上断成两截
+      const upstream = parseTraceparent(request.headers.traceparent as string | undefined);
+      const traceId =
+        upstream?.traceId || (request.headers['x-trace-id'] as string) || newTraceId();
+      const httpSpan = tracer.startSpan('http.chat.stream', {
+        traceId,
+        parentSpanId: upstream?.spanId,
+        attributes: { tenant: principal.tenantId, streaming: true },
+      });
       // v1.0：客户端断开 → 中断本轮。v0.6 只停止写出，模型继续跑完 ——
       // 那不是浪费 CPU，是在给一个已经没人看的回答付钱
       const controller = new AbortController();
-      const prepared = await prepareTurn(request.body, principal, traceId, controller.signal, {
+      const prepared = await prepareTurn(request.body, principal, traceId, controller.signal, httpSpan, {
         onIntent: (state) =>
           writer?.writeIntent({
             intent: state.intent,
@@ -556,12 +644,16 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
           }),
       });
       if (!prepared.ok) {
+        httpSpan.setAttribute('http.status', prepared.status);
+        httpSpan.setAttribute('error.code', prepared.code);
+        httpSpan.end();
         return reply
           .status(prepared.status)
           .send(errorBody(prepared.code, prepared.message));
       }
 
-      const { session, loop, bus } = prepared;
+      const { session, loop, bus, release } = prepared;
+      httpSpan.setAttribute('session', session.getId());
 
       // ── 幂等（SSE 版）──
       //
@@ -616,8 +708,10 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       bus.subscribe((event: AgentEvent) => writer.writeEvent(event));
 
       try {
-        await loop.run(request.body.message);
-        if (idemKey) {
+        const turn = await loop.run(request.body.message);
+        // v1.2：失败的轮次不该被幂等键固化。判定改用**结构化 outcome**，
+        // 不再靠 v1.1 那个「订阅 error 事件旁路拼凑」的做法
+        if (idemKey && turn.outcome !== 'error') {
           // 存的是**指路信息**而不是流：重复请求会拿到 409 + 这个 session_id，
           // 调用方据此去 /v1/sessions/:id/messages 取结果
           await stores.idempotency.complete({
@@ -632,6 +726,9 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         if (idemKey) await stores.idempotency.release(idemKey, principal.keyId).catch(() => {});
         writer.writeError('internal_error', (err as Error).message);
       } finally {
+        // 无论成败都要还锁 —— 靠 TTL 兜底意味着一次异常会让这条会话罚站一分钟
+        await release().catch(() => {});
+        httpSpan.end();
         writer.close();
       }
 
@@ -649,7 +746,14 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
       const principal = requireScope(request, reply, 'chat');
       if (!principal) return reply;
 
-      const traceId = (request.headers['x-trace-id'] as string) || newTraceId();
+      const upstream = parseTraceparent(request.headers.traceparent as string | undefined);
+      const traceId =
+        upstream?.traceId || (request.headers['x-trace-id'] as string) || newTraceId();
+      const httpSpan = tracer.startSpan('http.chat.sync', {
+        traceId,
+        parentSpanId: upstream?.spanId,
+        attributes: { tenant: principal.tenantId, streaming: false },
+      });
 
       // 非流式端点是**响应可以被完整存下来重放**的那一类，所以走完整的幂等语义。
       // 这一层挡的是最贵的一种重复：客户端超时重发 → 退款被执行两次。
@@ -661,7 +765,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         'POST /v1/chat/sync',
         request.body,
         async (): Promise<IdempotentOutcome> => {
-          const prepared = await prepareTurn(request.body, principal, traceId, undefined);
+          const prepared = await prepareTurn(request.body, principal, traceId, undefined, httpSpan);
           if (!prepared.ok) {
             return {
               status: prepared.status,
@@ -669,30 +773,47 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
             };
           }
 
-          const { session, loop, bus, tracker } = prepared;
+          const { session, loop, bus, tracker, release } = prepared;
           const blocked: { by: string; reason: string }[] = [];
           // v0.13：非流式调用方也要能拿到结构化数据，否则只能去解析 reply 里的中文
           const artifacts: Array<{ tool: string; artifact: ToolArtifact }> = [];
-          let upstreamError: string | null = null;
           bus.subscribe((event) => {
             if (event.type === 'blocked') blocked.push({ by: event.by, reason: event.reason });
             if (event.type === 'artifact') {
               artifacts.push({ tool: event.toolName, artifact: event.artifact });
             }
-            if (event.type === 'error') upstreamError = event.error;
           });
 
-          const reply_text = await loop.run(request.body.message);
+          let turn: Awaited<ReturnType<typeof loop.run>>;
+          try {
+            turn = await loop.run(request.body.message);
+          } finally {
+            await release().catch(() => {});
+          }
           const summary = tracker.getSummary();
 
-          // v1.1：模型调用失败时 AgentLoop 会把 `LLM调用失败: xxx` 当作**正常回复正文**
-          // 返回（agent-loop.ts:247）。回 200 有两层后果：接入方把这句话当成客服的
-          // 回答展示给客户；而幂等键会把这个"成功响应"存 24 小时 ——
-          // 一次几秒的抖动被固化成一天。5xx 让既有的「不落幂等记录」规则接管
-          if (upstreamError) {
+          // v1.1 靠订阅 error 事件旁路判断失败；v1.2 有了结构化 outcome，
+          // 判定与错误码都直接来自轮次结果 —— 少一处需要同步维护的真相。
+          //
+          // `retryable` 原样透出：调用方据它决定「换个说法再问一次」还是「转人工」。
+          // 让每个接入方自己猜，等于每家发明一套不同的判断逻辑
+          // **只有 `error` 是传输层失败**（下游挂了），走 5xx。
+          // `blocked` 与 `max_turns` 是**业务上成立的结果** ——
+          // 客户问了不该问的、或者问题太复杂没收敛，这两件事都发生在
+          // 一次正常的交互里，用 5xx 表达会让监控上的错误率变成噪声（v1.0 定的调）。
+          // 它们靠响应体里的 `outcome` 与调用方沟通，而不是靠状态码。
+          if (turn.outcome === 'error') {
             return {
               status: 502,
-              body: errorBody('upstream_error', upstreamError),
+              body: {
+                error: {
+                  code: 'upstream_error',
+                  message: turn.error!.message,
+                  retryable: turn.error!.retryable,
+                },
+                session_id: session.getId(),
+                trace_id: traceId,
+              },
             };
           }
 
@@ -701,7 +822,17 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
             body: {
               session_id: session.getId(),
               trace_id: traceId,
-              reply: reply_text,
+              // v1.2：轮次结果显式给出。在此之前调用方只能看 reply 的内容猜
+              //（「这句话是回答，还是一句伪装成回答的失败说明？」）
+              outcome: turn.outcome,
+              reply: turn.reply,
+              error: turn.error
+                ? {
+                    code: turn.error.code,
+                    message: turn.error.message,
+                    retryable: turn.error.retryable,
+                  }
+                : undefined,
               artifacts: artifacts.map((a) => ({
                 tool: a.tool,
                 type: a.artifact.type,
@@ -718,6 +849,10 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         },
         { ttlMs: opts.idempotencyTtlMs }
       );
+
+      httpSpan.setAttribute('http.status', outcome.status);
+      if (outcome.status >= 500) httpSpan.recordError(new Error(`HTTP ${outcome.status}`));
+      httpSpan.end();
 
       return reply
         .status(outcome.status)
@@ -1130,6 +1265,50 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
     }
   );
 
+  // ============ 链路查询（v1.2） ============
+
+  /**
+   * 查一条链路的 span。
+   *
+   * ⚠️ 读的是**本实例**的内存环形缓冲 —— 多实例部署下只能看到打到这台机器的那部分。
+   * 要全局查询就该上真 collector（OTLP 已经通了）。这个接口的定位是
+   * 「没有 collector 时也能看链路」，不是替代 collector。
+   */
+  app.get<{ Params: { id: string } }>('/v1/traces/:id', async (request, reply) => {
+    const principal = requireScope(request, reply, 'read');
+    if (!principal) return reply;
+
+    const spans = spanBuffer.byTrace(request.params.id);
+
+    // **归属由 http span 决定**，而不是逐个 span 过滤。
+    // 逐个过滤是错的：`model.chat` / `tool.execute` 上根本没有 tenant 属性，
+    // 它们会直接漏给任何人 —— 而工具 span 的属性里带着工具名和参数。
+    // 一条链路属于发起它的那个请求，这是唯一说得通的归属定义。
+    const root = spans.find((s) => s.name.startsWith('http.'));
+    if (!root || !canAccessTenant(principal, String(root.attributes.tenant ?? ''))) {
+      return notFound(reply, 'trace_not_found', `链路 ${request.params.id} 不存在`);
+    }
+    const own = spans;
+
+    const start = Math.min(...own.map((s) => s.startTime));
+    return reply.send({
+      trace_id: request.params.id,
+      note: '本接口读的是本实例内存缓冲；多实例下请以 OTLP collector 为准',
+      duration_ms: Math.max(...own.map((s) => s.endTime)) - start,
+      spans: own.map((s) => ({
+        span_id: s.spanId,
+        parent_span_id: s.parentSpanId ?? null,
+        name: s.name,
+        // 相对偏移比绝对时间戳好读 —— 看链路时关心的是"第几毫秒发生了什么"
+        offset_ms: s.startTime - start,
+        duration_ms: s.endTime - s.startTime,
+        status: s.status,
+        error: s.error ?? null,
+        attributes: s.attributes,
+      })),
+    });
+  });
+
   // ============ 健康检查 ============
 
   /**
@@ -1162,6 +1341,7 @@ export async function buildApp(opts: AppOptions): Promise<FastifyInstance> {
         // **进程内限流在多实例下是 N 倍配额**。这个事实必须暴露给运维 ——
         // 「限流失准」这件事，运维不知道就等于没有限流
         rate_limit: rateLimiter.kind,
+        tracing: tracer.exporterKind,
       });
     } catch (err) {
       return reply

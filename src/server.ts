@@ -6,6 +6,12 @@ import { parseSafetyLag } from './server/config.js';
 import { installGracefulShutdown } from './server/shutdown.js';
 import { RemoteToolGateway, FetchTransport } from './tools/remote-gateway.js';
 import { AUTH_DISABLED_WARNING } from './server/auth.js';
+import {
+  MemorySpanExporter,
+  MultiSpanExporter,
+  OtlpHttpExporter,
+  Tracer,
+} from './observability/tracing.js';
 
 /**
  * HTTP 服务入口（`npm run serve`）。
@@ -42,12 +48,28 @@ async function main(): Promise<void> {
 
   const rateLimitRps = Number(process.env.AGENT_RATE_LIMIT_RPS ?? 20);
 
+  // v1.2 追踪：内存缓冲总是有（让 /v1/traces 在没有 collector 时也能用），
+  // 设了 OTLP 端点就再加一路导出。两路互不影响 —— collector 挂了本地照样能看
+  const otlpEndpoint = process.env.AGENT_OTLP_ENDPOINT;
+  const spanBuffer = new MemorySpanExporter(
+    Number(process.env.AGENT_TRACE_BUFFER ?? 2000)
+  );
+  const tracer = new Tracer({
+    exporter: otlpEndpoint
+      ? new MultiSpanExporter([spanBuffer, new OtlpHttpExporter(otlpEndpoint)])
+      : spanBuffer,
+  });
+
   const toolServiceUrl = process.env.TOOL_SERVICE_URL;
   const app = await buildApp({
     stores,
     config,
     logger: true,
     auth: { disabled: authDisabled },
+    tracer,
+    spanBuffer,
+    turnLockTtlMs: Number(process.env.AGENT_TURN_LOCK_TTL_MS ?? 60_000),
+    sweepIntervalMs: Number(process.env.AGENT_SWEEP_INTERVAL_MS ?? 600_000),
     rateLimit: {
       rps: rateLimitRps,
       redisUrl: process.env.REDIS_URL,
@@ -89,6 +111,9 @@ async function main(): Promise<void> {
     `  认证:     ${authDisabled ? '⚠️  已关闭（AGENT_AUTH_DISABLED=1）' : '已启用（Bearer API Key）'}`
   );
   console.log(
+    `  追踪:     ${tracer.exporterKind}${otlpEndpoint ? `（OTLP → ${otlpEndpoint}）` : '（内存，设 AGENT_OTLP_ENDPOINT 可接 collector）'}`
+  );
+  console.log(
     `  限流:     ${rateLimitRps > 0 ? `${rateLimitRps} rps/凭证${process.env.REDIS_URL ? '（Redis 全局）' : '（进程内 —— 多实例下是 N 倍）'}` : '未启用'}`
   );
   console.log('');
@@ -98,6 +123,7 @@ async function main(): Promise<void> {
   console.log('  GET  /v1/sessions/:id/messages');
   console.log('  GET  /v1/users/:id/profile');
   console.log('  POST /v1/confirmations/:id');
+  console.log('  GET  /v1/traces/:trace_id → 本实例链路');
   console.log('  GET  /healthz  ·  GET /metrics   → 免认证');
   console.log('');
   console.log('  签发凭证: npm run key:issue -- --tenant <租户号> --scopes chat,read');

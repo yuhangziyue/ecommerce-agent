@@ -26,6 +26,11 @@ export interface ToolContext {
   tenantId?: string | null;
   /** v0.15：跨进程链路号。工具服务打日志时带上它，一次对话的动作才串得起来 */
   traceId?: string;
+  /**
+   * v1.2：调用方那一侧的 span id，用来串 `traceparent`。
+   * 有它，工具服务里的 span 才能挂到编排层的 span 下面。
+   */
+  spanId?: string;
   /** v1.0：取消信号。客户端断开后工具不该继续跑 */
   signal?: AbortSignal;
 }
@@ -159,7 +164,14 @@ export type AgentEvent =
    */
   | { type: 'tool_rejected'; toolName: string; reason: string }
   | { type: 'response'; content: string }
-  | { type: 'error'; error: string }
+  /**
+   * v1.2：错误事件带上**机器可读的分类**。
+   *
+   * 在此之前它只有一句中文。消费方要判断「该不该重试」只能做字符串匹配 ——
+   * 而那句话是给人看的，随时会改。每个接入方各自发明一遍判断逻辑，
+   * 且各不相同，这本身就是缺陷。
+   */
+  | { type: 'error'; error: string; code: TurnErrorCode; retryable: boolean }
   /** 被中间件拦截（注入检测 / 预算熔断 / 后续版本的合规与配额）；by 为中间件名 */
   | { type: 'blocked'; by: string; reason: string }
   /**
@@ -168,6 +180,43 @@ export type AgentEvent =
    */
   | { type: 'cancelled'; reason: string }
   | { type: 'done'; totalTokens: TokenUsage; totalCost: number };
+
+// ============ 轮次结果（v1.2）============
+
+/**
+ * 一轮对话的失败分类。
+ *
+ * `retryable` 由它决定，而不是由调用方猜：
+ * 模型抖动值得重试，被安全规则拦下重试一万次也是同一个结果。
+ */
+export type TurnErrorCode =
+  | 'model_error'
+  | 'blocked'
+  | 'max_turns'
+  | 'internal_error';
+
+export type TurnOutcome = 'ok' | 'blocked' | 'cancelled' | 'error' | 'max_turns';
+
+/**
+ * `AgentLoop.run()` 的返回值（v1.2）。
+ *
+ * v0.1~v1.1 期间它是一个字符串 —— 成功时是回复，失败时是
+ * `LLM调用失败: xxx` 这样一句**冒充回复的错误正文**。CLI 会把它当客服的回答
+ * 打给用户；HTTP 层要判断成败只能靠订阅事件旁路拼凑。
+ *
+ * **`reply` 与 `outcome` 分开**是这个类型存在的全部意义：
+ * 状态用来判断，正文用来展示，两者揉在一个字符串里就只能靠字符串匹配。
+ */
+export interface TurnResult {
+  /** `outcome !== 'ok'` 时是空串 —— 失败不该看起来像成功 */
+  reply: string;
+  outcome: TurnOutcome;
+  error?: {
+    code: TurnErrorCode;
+    message: string;
+    retryable: boolean;
+  };
+}
 
 // ============ 模型调用抽象 ============
 

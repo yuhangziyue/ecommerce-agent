@@ -134,7 +134,11 @@ async function main(): Promise<void> {
           console.log(`\n🛡️  已拦截 [${data.by}]：${data.reason}`);
           break;
         case 'error':
+          // 错误**不走 🤖 前缀** —— 它不是客服的回答。
+          // v1.2 之前服务端把 `LLM调用失败: xxx` 当回复正文返回，
+          // 逐字打给用户看，用户以为客服真的这么说
           console.log(`\n❌ ${data.message}`);
+          if (data.retryable) console.log('   （这是临时故障，可以再试一次）');
           break;
         case 'done':
           totalCost += (data.cost_usd as number) ?? 0;

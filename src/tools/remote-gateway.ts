@@ -1,4 +1,5 @@
 import { newSpanId, type ToolDescriptor, type ToolGateway, type ValidationResult } from './gateway.js';
+import { formatTraceparent } from '../observability/tracing.js';
 import {
   CircuitBreaker,
   CircuitOpenError,
@@ -148,7 +149,12 @@ export class RemoteToolGateway implements ToolGateway {
               path: '/v1/tools/execute',
               headers: {
                 ...(ctx.traceId ? { 'x-trace-id': ctx.traceId } : {}),
-                'x-span-id': newSpanId(),
+                // v1.2：W3C 标准头。工具服务据此把自己的 span 挂到调用方的 span 下面。
+                // `x-trace-id` 保留 —— 日志里肉眼串链路仍然靠它
+                ...(ctx.traceId && ctx.spanId
+                  ? { traceparent: formatTraceparent(ctx.traceId, ctx.spanId) }
+                  : {}),
+                'x-span-id': ctx.spanId ?? newSpanId(),
               },
               body: { name, input, context: ctx },
             });

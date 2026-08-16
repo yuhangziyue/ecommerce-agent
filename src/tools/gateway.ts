@@ -92,13 +92,11 @@ export function describe(tool: AgentTool): ToolDescriptor {
 /**
  * 生成链路号。
  *
- * 不用 UUID 库 —— 一个只需要「够唯一、能肉眼比对」的 id 不值得加依赖。
- * 前缀 `tr_` 让它在日志里一眼能认出来。
+ * v1.2：改用 **W3C trace context 规格**（32/16 位十六进制）。
+ * 在此之前是 `tr_<base36>` —— 好认，但没法放进 `traceparent`；
+ * 而工具服务日后可能被别的系统调用，自造格式等于把链路锁死在自家生态里。
+ *
+ * 实现统一收在 `observability/tracing.ts`，这里只转发 ——
+ * 两个地方各生成一份 id 是「同一件事有两个真相」的经典开头。
  */
-export function newTraceId(): string {
-  return `tr_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
-}
-
-export function newSpanId(): string {
-  return `sp_${Math.random().toString(36).slice(2, 10)}`;
-}
+export { newTraceId, newSpanId } from '../observability/tracing.js';
