@@ -5,6 +5,9 @@
 从 v0.1 到 v1.2 走了 17 个版本，每版都有 SPEC / PLAN / REPORT 存档在
 [`docs/iterations/`](docs/iterations/)，总路线见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。
 
+**先读这两份**：[`docs/SUMMARY.md`](docs/SUMMARY.md)（17 版总结 + 缺陷账本）与
+[`docs/ARCHITECTURE-REVIEW.md`](docs/ARCHITECTURE-REVIEW.md)（架构体检与差距清单）。
+
 ```
 795 个用例 ｜ npm run verify exit 0 ｜ 离线评测 15/15 ｜ 三维回归门守着质量·成本·延迟
 ```
